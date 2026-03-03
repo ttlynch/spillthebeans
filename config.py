@@ -1,0 +1,26 @@
+"""Configuration module for Hyperliquid trading client."""
+
+import os
+from typing import List
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+HL_WALLET_ADDRESS: str = os.getenv("HL_WALLET_ADDRESS", "")
+HL_PRIVATE_KEY: str = os.getenv("HL_PRIVATE_KEY", "")
+HL_TESTNET: bool = os.getenv("HL_TESTNET", "true").lower() in ("true", "1", "yes")
+
+ASSETS: List[str] = ["BTC", "ETH", "SOL"]
+
+
+def validate_config() -> None:
+    """Validate that required configuration is present."""
+    if not HL_WALLET_ADDRESS:
+        raise ValueError("HL_WALLET_ADDRESS not set in environment")
+    if not HL_PRIVATE_KEY:
+        raise ValueError("HL_PRIVATE_KEY not set in environment")
+    if not HL_WALLET_ADDRESS.startswith("0x") or len(HL_WALLET_ADDRESS) != 42:
+        raise ValueError("HL_WALLET_ADDRESS must be a valid Ethereum address (0x...)")
+    if not HL_PRIVATE_KEY.startswith("0x") or len(HL_PRIVATE_KEY) != 66:
+        raise ValueError("HL_PRIVATE_KEY must be a valid hex private key (0x...)")
