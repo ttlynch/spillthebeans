@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+SYNTH_API_KEY: str = os.getenv("SYNTH_API_KEY", "")
 HL_WALLET_ADDRESS: str = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY: str = os.getenv("HL_PRIVATE_KEY", "")
 HL_TESTNET: bool = os.getenv("HL_TESTNET", "true").lower() in ("true", "1", "yes")

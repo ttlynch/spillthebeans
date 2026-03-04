@@ -21,6 +21,9 @@ env/
 *.sqlite
 *.sqlite3
 
+# Data directory
+data/
+
 # Logs
 *.log
 
