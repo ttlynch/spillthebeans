@@ -26,6 +26,7 @@ class Signal:
     vol_spread_pct: float
     timestamp: datetime
     percentiles_snapshot: Dict[str, Any]
+    id: Optional[int] = None
 
 
 def evaluate_signal(asset: str, percentile_data: Dict[str, Any]) -> Optional[Signal]:

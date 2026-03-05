@@ -233,3 +233,17 @@ def get_signal_history(
         signals.append(signal_dict)
 
     return signals
+
+
+def update_signal_status(conn: sqlite3.Connection, signal_id: int, status: str) -> None:
+    """Update signal status.
+
+    Args:
+        conn: Database connection
+        signal_id: Signal ID
+        status: New status ('pending', 'executed', 'passed')
+    """
+    cursor = conn.cursor()
+    cursor.execute("UPDATE signals SET status = ? WHERE id = ?", (status, signal_id))
+    conn.commit()
+    logger.info(f"Updated signal {signal_id} status to {status}")
