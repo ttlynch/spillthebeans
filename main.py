@@ -1,5 +1,6 @@
 """Main entry point for SpillTheBeans trading bot."""
 
+import argparse
 import asyncio
 import logging
 from config import (
@@ -14,17 +15,38 @@ from hl_client import HLClient
 from synth_client import SynthClient
 from telegram_bot import create_bot
 from execution import synth_poller, position_monitor
+from logging_config import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("spillthebeans.log"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="SpillTheBeans - Synth-powered trading bot for Hyperliquid"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run without placing real orders (signals sent to Telegram, orders logged but not executed)",
+    )
+    return parser.parse_args()
 
 
 async def main():
     """Main entry point that runs all concurrent tasks."""
+    args = parse_args()
+
+    setup_logging()
+
+    if args.dry_run:
+        logger.warning(
+            "🧪 DRY-RUN MODE ENABLED - Orders will be logged but not executed"
+        )
+        import config
+
+        config.DRY_RUN = True
+
     logger.info("Starting SpillTheBeans trading bot...")
 
     try:
@@ -45,7 +67,9 @@ async def main():
     synth_client = SynthClient()
     logger.info("Synth API client initialized")
 
-    telegram_app = create_bot(db_conn=db_conn, hl_client=hl_client)
+    telegram_app = create_bot(
+        db_conn=db_conn, hl_client=hl_client, synth_client=synth_client
+    )
     logger.info("Telegram bot initialized")
 
     async def run_telegram_bot(telegram_app, allowed_updates):

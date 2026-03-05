@@ -15,21 +15,23 @@ from config import (
     HL_PRIVATE_KEY,
     HL_TESTNET,
 )
-from db import get_open_positions, get_signal_history, init_db, save_signal
-from strategy import Signal, calculate_trade_stats
+from db import (
+    get_open_positions,
+    get_signal_history,
+    get_closed_positions,
+    get_position_stats,
+    init_db,
+    save_signal,
+)
+from strategy import Signal, calculate_trade_stats, evaluate_test_signal
 from chart_renderer import (
     render_pnl_summary,
     render_signal_chart,
-    _generate_mock_candles,
+    fetch_candles,
 )
 from hl_client import HLClient
-from execution import execute_signal
+from execution import execute_signal, calculate_pnl
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("spillthebeans.log"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
 
 _selected_sizes: Dict[int, float] = {}
@@ -129,7 +131,8 @@ async def send_pnl_update(
     direction: str,
     entry: float,
     current_price: float,
-    unrealized_pnl: float,
+    pnl_usd: float,
+    pnl_pct: float,
     duration_min: int,
     application: Application = None,
 ) -> None:
@@ -138,12 +141,14 @@ async def send_pnl_update(
         logger.error("No application instance provided")
         return
 
-    pnl_sign = "+" if unrealized_pnl >= 0 else ""
+    is_profit = pnl_usd >= 0
+    pnl_sign = "+" if is_profit else ""
+    emoji = "✅" if is_profit else "❌"
+
     message = (
-        f"📊 {asset} {direction.upper()} Update\n"
-        f"Entry: ${entry:,.2f} → Current: ${current_price:,.2f}\n"
-        f"Unrealized P&L: {pnl_sign}${unrealized_pnl:,.2f}\n"
-        f"Duration: {int(duration_min)} min"
+        f"📊 {asset} {direction.upper()} — {duration_min} min open\n"
+        f"Entry: ${entry:,.2f} → Now: ${current_price:,.2f}\n"
+        f"P&L: {pnl_sign}${abs(pnl_usd):.2f} ({pnl_sign}{pnl_pct:.2f}%) {emoji}"
     )
 
     try:
@@ -163,6 +168,7 @@ async def send_close_summary(
     pnl_usd: float,
     pnl_pct: float,
     duration_min: int,
+    win_rate: float,
     application: Application = None,
 ) -> None:
     """Send P&L summary chart."""
@@ -170,13 +176,16 @@ async def send_close_summary(
         logger.error("No application instance provided")
         return
 
-    pnl_sign = "+" if pnl_usd >= 0 else ""
+    is_profit = pnl_usd >= 0
+    pnl_sign = "+" if is_profit else ""
+    emoji = "✅" if is_profit else "❌"
+
     caption = (
-        f"📈 Position Closed\n"
-        f"{asset} {direction.upper()}\n"
+        f"🏁 {asset} {direction.upper()} Closed\n"
         f"Entry: ${entry:,.2f} → Exit: ${exit_price:,.2f}\n"
-        f"P&L: {pnl_sign}${abs(pnl_usd):,.2f} ({pnl_sign}{pnl_pct:.2f}%)\n"
-        f"Duration: {int(duration_min)} min"
+        f"P&L: {pnl_sign}${abs(pnl_usd):.2f} ({pnl_sign}{pnl_pct:.2f}%) {emoji}\n"
+        f"Duration: {duration_min} minutes\n"
+        f"Signal Win Rate was: {win_rate:.0%}"
     )
 
     try:
@@ -341,7 +350,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/start - Show this message\n"
         "/status - View open positions\n"
         "/history - View last 10 signals\n"
-        "/test_signal - Send mock BTC signal for testing\n\n"
+        "/test_signal [BTC|ETH|SOL] - Send test signal for asset (default: BTC)\n\n"
         "*How it works:*\n"
         "1. Bot analyzes Synth API predictions\n"
         "2. Sends signal alerts with charts\n"
@@ -362,30 +371,49 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⚠️ Database error. Check logs.")
         return
 
+    hl_client = context.application.bot_data.get("hl_client")
+    if not hl_client:
+        await update.message.reply_text("⚠️ Hyperliquid client not initialized.")
+        return
+
     positions = get_open_positions(conn)
 
     if not positions:
-        await update.message.reply_text("No open positions.")
+        await update.message.reply_text(
+            "📊 No open positions.\nWatching BTC, ETH, SOL for signals..."
+        )
         return
 
-    message = "📊 *Open Positions*\n\n"
+    message = f"📊 Open Positions: {len(positions)}\n\n"
 
     for pos in positions:
+        asset = pos["asset"]
+        direction = pos["direction"]
+        entry = float(pos["entry_price"])
+        size_usd = float(pos["size_usd"])
+
+        current_price = hl_client.get_mid_price(asset)
+        pnl_usd, pnl_pct = calculate_pnl(direction, size_usd, entry, current_price)
+
         opened_at = datetime.fromisoformat(pos["opened_at"])
-        duration_min = (datetime.utcnow() - opened_at).total_seconds() / 60
+        duration_min = int((datetime.utcnow() - opened_at).total_seconds() / 60)
+
+        is_profit = pnl_usd >= 0
+        pnl_sign = "+" if is_profit else ""
+        emoji = "✅" if is_profit else "❌"
 
         message += (
-            f"*{pos['asset']} {pos['direction'].upper()}*\n"
-            f"Entry: ${pos['entry_price']:,.2f}\n"
-            f"Size: ${pos['size_usd']:,.0f}\n"
-            f"Duration: {int(duration_min)} min\n\n"
+            f"*{asset} {direction.upper()}*\n"
+            f"Entry: ${entry:,.2f} → Now: ${current_price:,.2f}\n"
+            f"Unrealized P&L: {pnl_sign}${abs(pnl_usd):.2f} ({pnl_sign}{pnl_pct * 100:.2f}%) {emoji}\n"
+            f"Duration: {duration_min} minutes\n\n"
         )
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /history command - show last 10 signals."""
+    """Handle /history command - show last 10 closed positions."""
     if not _validate_chat(update):
         return
 
@@ -394,27 +422,56 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ Database error. Check logs.")
         return
 
-    signals = get_signal_history(conn, limit=10)
+    positions = get_closed_positions(conn, limit=10)
+    stats = get_position_stats(conn)
 
-    if not signals:
-        await update.message.reply_text("No signal history.")
+    if not positions:
+        await update.message.reply_text("📜 No closed positions yet.")
         return
 
-    message = "📜 *Recent Signals*\n\n"
+    message = f"📜 Recent Closed Positions ({len(positions)})\n\n"
 
-    for sig in signals:
-        status_emoji = {"pending": "⏳", "executed": "✅", "passed": "❌"}.get(
-            sig["status"], "❓"
+    for pos in positions:
+        asset = pos["asset"]
+        direction = pos["direction"]
+        pnl = float(pos["pnl"]) if pos["pnl"] else 0.0
+
+        opened_at = datetime.fromisoformat(pos["opened_at"])
+        closed_at = datetime.fromisoformat(pos["closed_at"])
+        duration_min = int((closed_at - opened_at).total_seconds() / 60)
+
+        is_profit = pnl >= 0
+        pnl_sign = "+" if is_profit else ""
+        emoji = "✅" if is_profit else "❌"
+
+        entry = float(pos["entry_price"])
+        exit_price = float(pos["exit_price"]) if pos["exit_price"] else entry
+        pnl_pct = (
+            ((exit_price - entry) / entry * 100)
+            if direction == "long"
+            else ((entry - exit_price) / entry * 100)
         )
-
-        timestamp = datetime.fromisoformat(sig["timestamp"])
-        time_str = timestamp.strftime("%m/%d %H:%M")
 
         message += (
-            f"{status_emoji} *{sig['asset']} {sig['direction'].upper()}*\n"
-            f"Entry: ${sig['entry']:,.2f} | {sig['status'].capitalize()}\n"
-            f"{time_str}\n\n"
+            f"{emoji} {asset} {direction.upper()} — {pnl_sign}${abs(pnl):.2f} ({pnl_sign}{pnl_pct:.2f}%)\n"
+            f"Duration: {duration_min} minutes\n\n"
         )
+
+    total_pnl = stats["total_pnl"]
+    win_count = stats["win_count"]
+    total_count = stats["total_count"]
+    avg_duration = stats["avg_duration_min"]
+
+    total_sign = "+" if total_pnl >= 0 else ""
+    total_emoji = "✅" if total_pnl >= 0 else "❌"
+    win_rate = (win_count / total_count * 100) if total_count > 0 else 0
+
+    message += (
+        f"📊 *Overall Stats:*\n"
+        f"Total P&L: {total_sign}${abs(total_pnl):.2f} {total_emoji}\n"
+        f"Win Rate: {win_count}/{total_count} ({win_rate:.0f}%)\n"
+        f"Avg Duration: {avg_duration} minutes"
+    )
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -422,7 +479,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def test_signal_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle /test_signal command - send mock BTC signal for testing."""
+    """Handle /test_signal command - send test signal using real Synth data."""
     if not _validate_chat(update):
         return
 
@@ -431,45 +488,62 @@ async def test_signal_command(
         await update.message.reply_text("⚠️ Database error. Check logs.")
         return
 
-    hl_client = context.application.bot_data.get("hl_client")
-    if not hl_client:
-        await update.message.reply_text("⚠️ Hyperliquid client not initialized.")
+    synth_client = context.application.bot_data.get("synth_client")
+    if not synth_client:
+        await update.message.reply_text("⚠️ Synth client not initialized.")
         return
 
-    entry_price = hl_client.get_mid_price("BTC")
+    allowed_assets = ["BTC", "ETH", "SOL"]
+    asset = "BTC"
+    if context.args and len(context.args) > 0:
+        arg = context.args[0].upper()
+        if arg in allowed_assets:
+            asset = arg
+        else:
+            await update.message.reply_text(
+                f"⚠️ Invalid asset. Allowed: {', '.join(allowed_assets)}"
+            )
+            return
 
-    signal = Signal(
-        asset="BTC",
-        direction="long",
-        entry_price=entry_price,
-        take_profit=entry_price * 1.005,
-        stop_loss=entry_price * 0.99,
-        win_rate=0.71,
-        vol_spread_pct=1.8,
-        timestamp=datetime.now(),
-        percentiles_snapshot={},
-    )
+    try:
+        percentile_data = await synth_client.get_prediction_percentiles(asset, "1h")
+    except Exception as e:
+        logger.error(f"Failed to fetch Synth data: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Failed to fetch Synth data.")
+        return
+
+    try:
+        signal = evaluate_test_signal(asset, percentile_data)
+    except ValueError as e:
+        logger.error(f"Failed to evaluate test signal: {e}", exc_info=True)
+        await update.message.reply_text(f"⚠️ Failed to evaluate signal: {e}")
+        return
 
     signal_id = save_signal(conn, signal)
     signal.id = signal_id
 
-    percentile_band = (entry_price * 0.99, entry_price * 1.01)
-    candles = _generate_mock_candles(60, base_price=entry_price)
+    p05 = signal.percentiles_snapshot.get("0.05", signal.stop_loss)
+    p95 = signal.percentiles_snapshot.get("0.95", signal.take_profit)
+    percentile_band = (p05, p95)
+
+    candles = fetch_candles(asset, num_candles=60)
     chart_image = render_signal_chart(
         candle_data=candles,
         signal=signal,
         percentile_band=percentile_band,
-        asset="BTC",
+        asset=asset,
     )
 
-    logger.info(f"Test signal created: BTC LONG, signal_id={signal_id}")
+    logger.info(
+        f"Test signal created: {asset} {signal.direction.upper()}, signal_id={signal_id}"
+    )
 
     await send_signal_alert(
         signal, chart_image, default_size=100.0, application=context.application
     )
 
 
-def create_bot(db_conn=None, hl_client=None) -> Application:
+def create_bot(db_conn=None, hl_client=None, synth_client=None) -> Application:
     """Create and configure Telegram bot application."""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN not configured")
@@ -481,6 +555,9 @@ def create_bot(db_conn=None, hl_client=None) -> Application:
 
     if hl_client:
         application.bot_data["hl_client"] = hl_client
+
+    if synth_client:
+        application.bot_data["synth_client"] = synth_client
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))

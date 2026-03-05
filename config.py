@@ -17,6 +17,10 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 ASSETS: List[str] = ["BTC", "ETH", "SOL"]
 DEFAULT_POSITION_SIZE_USD: float = 100.0
 
+PRICE_DRIFT_TOLERANCE: float = 0.03 if HL_TESTNET else 0.005
+
+DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+
 
 def validate_config() -> None:
     """Validate that required configuration is present."""

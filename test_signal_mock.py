@@ -1,6 +1,12 @@
 """Test script for signal evaluation pipeline using mock data."""
 
-from strategy import evaluate_signal, calculate_trade_stats, Signal, _cooldown_tracker
+from strategy import (
+    evaluate_signal,
+    calculate_trade_stats,
+    Signal,
+    _cooldown_tracker,
+    evaluate_test_signal,
+)
 from db import init_db, save_signal, get_signal_history
 from datetime import datetime
 import os
@@ -225,6 +231,122 @@ def test_cooldown() -> bool:
     return True
 
 
+def test_evaluate_test_signal_long() -> bool:
+    """Test evaluate_test_signal LONG scenario."""
+    print("\n=== TEST 5: TEST SIGNAL LONG ===")
+
+    last_percentiles = {
+        "0.05": 66800,
+        "0.2": 66950,
+        "0.35": 67050,
+        "0.5": 67150,
+        "0.65": 67250,
+        "0.8": 67400,
+        "0.95": 67600,
+        "0.005": 66700,
+        "0.995": 67700,
+    }
+
+    mock_data = build_mock_response(67000, last_percentiles)
+    signal = evaluate_test_signal("BTC", mock_data)
+
+    if signal.direction != "long":
+        print(f"FAIL - Expected direction 'long', got '{signal.direction}'")
+        return False
+
+    if signal.entry_price != 67000:
+        print(f"FAIL - Expected entry_price 67000, got {signal.entry_price}")
+        return False
+
+    if signal.take_profit != 67150:
+        print(f"FAIL - Expected take_profit 67150 (p50), got {signal.take_profit}")
+        return False
+
+    if signal.stop_loss != 66800:
+        print(f"FAIL - Expected stop_loss 66800 (p05), got {signal.stop_loss}")
+        return False
+
+    print("PASS - Test LONG signal generated correctly")
+    print("Signal:")
+    print_signal(signal)
+    return True
+
+
+def test_evaluate_test_signal_short() -> bool:
+    """Test evaluate_test_signal SHORT scenario."""
+    print("\n=== TEST 6: TEST SIGNAL SHORT ===")
+
+    last_percentiles = {
+        "0.05": 66300,
+        "0.2": 66500,
+        "0.35": 66700,
+        "0.5": 66850,
+        "0.65": 66950,
+        "0.8": 67050,
+        "0.95": 67200,
+        "0.005": 66200,
+        "0.995": 67300,
+    }
+
+    mock_data = build_mock_response(67000, last_percentiles)
+    signal = evaluate_test_signal("ETH", mock_data)
+
+    if signal.direction != "short":
+        print(f"FAIL - Expected direction 'short', got '{signal.direction}'")
+        return False
+
+    if signal.entry_price != 67000:
+        print(f"FAIL - Expected entry_price 67000, got {signal.entry_price}")
+        return False
+
+    if signal.take_profit != 66850:
+        print(f"FAIL - Expected take_profit 66850 (p50), got {signal.take_profit}")
+        return False
+
+    if signal.stop_loss != 67200:
+        print(f"FAIL - Expected stop_loss 67200 (p95), got {signal.stop_loss}")
+        return False
+
+    print("PASS - Test SHORT signal generated correctly")
+    print("Signal:")
+    print_signal(signal)
+    return True
+
+
+def test_evaluate_test_signal_no_cooldown() -> bool:
+    """Test that evaluate_test_signal ignores cooldown."""
+    print("\n=== TEST 7: TEST SIGNAL NO COOLDOWN ===")
+
+    _cooldown_tracker.clear()
+
+    last_percentiles = {
+        "0.05": 66800,
+        "0.2": 66950,
+        "0.35": 67050,
+        "0.5": 67150,
+        "0.65": 67250,
+        "0.8": 67400,
+        "0.95": 67600,
+        "0.005": 66700,
+        "0.995": 67700,
+    }
+
+    mock_data = build_mock_response(67000, last_percentiles)
+
+    signal1 = evaluate_test_signal("BTC", mock_data)
+    if signal1 is None:
+        print("FAIL - First test signal should be generated")
+        return False
+
+    signal2 = evaluate_test_signal("BTC", mock_data)
+    if signal2 is None:
+        print("FAIL - Second test signal should NOT be blocked by cooldown")
+        return False
+
+    print("PASS - Test signals ignore cooldown")
+    return True
+
+
 def main():
     """Run all tests."""
     db_path = "data/test_trading.db"
@@ -240,6 +362,9 @@ def main():
     results.append(("SHORT signal", test_short_signal(conn)))
     results.append(("NEUTRAL signal", test_neutral_signal()))
     results.append(("Cooldown", test_cooldown()))
+    results.append(("Test signal LONG", test_evaluate_test_signal_long()))
+    results.append(("Test signal SHORT", test_evaluate_test_signal_short()))
+    results.append(("Test signal no cooldown", test_evaluate_test_signal_no_cooldown()))
 
     conn.close()
 

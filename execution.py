@@ -3,12 +3,18 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, Dict, Any
 
 from hl_client import HLClient
 from strategy import Signal
 from db import get_open_positions, save_position, update_position
-from config import HL_WALLET_ADDRESS, HL_PRIVATE_KEY, HL_TESTNET
+from config import (
+    HL_WALLET_ADDRESS,
+    HL_PRIVATE_KEY,
+    HL_TESTNET,
+    PRICE_DRIFT_TOLERANCE,
+    DRY_RUN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +109,10 @@ def check_signal_validity(
     """Check if signal is still valid for execution.
 
     Validates:
-    1. Entry price hasn't moved more than 0.5% from signal's entry
-    2. Signal is less than 10 minutes old
-    3. No existing open position for the same asset
+    1. Maximum 3 total open positions
+    2. Maximum 1 open position per asset
+    3. Signal is less than 10 minutes old
+    4. Entry price hasn't moved more than PRICE_DRIFT_TOLERANCE from signal's entry
 
     Args:
         signal: Signal object
@@ -115,17 +122,8 @@ def check_signal_validity(
     Returns:
         Tuple of (is_valid, reason)
     """
-    now = datetime.utcnow()
-    signal_age = (now - signal.timestamp).total_seconds() / 60
-
-    if signal_age > 10:
-        reason = f"Signal too old ({signal_age:.1f} minutes > 10 min limit)"
-        logger.info(f"Signal invalid: {reason}")
-        return False, reason
-
-    entry_diff_pct = abs(current_price - signal.entry_price) / signal.entry_price * 100
-    if entry_diff_pct > 0.5:
-        reason = f"Price moved too much ({entry_diff_pct:.2f}% > 0.5% limit)"
+    if len(existing_positions) >= 3:
+        reason = "Maximum 3 open positions reached"
         logger.info(f"Signal invalid: {reason}")
         return False, reason
 
@@ -135,8 +133,50 @@ def check_signal_validity(
             logger.info(f"Signal invalid: {reason}")
             return False, reason
 
+    now = datetime.utcnow()
+    signal_age = (now - signal.timestamp).total_seconds() / 60
+
+    if signal_age > 10:
+        reason = f"Signal too old ({signal_age:.1f} minutes > 10 min limit)"
+        logger.info(f"Signal invalid: {reason}")
+        return False, reason
+
+    entry_diff_pct = abs(current_price - signal.entry_price) / signal.entry_price * 100
+    drift_limit_pct = PRICE_DRIFT_TOLERANCE * 100
+    if entry_diff_pct > drift_limit_pct:
+        reason = f"Price moved too much ({entry_diff_pct:.2f}% > {drift_limit_pct:.1f}% limit)"
+        logger.info(f"Signal invalid: {reason}")
+        return False, reason
+
     logger.info(f"Signal valid: {signal.asset} {signal.direction}")
     return True, ""
+
+
+def get_actual_fill_price(hl_client: HLClient, asset: str) -> Optional[float]:
+    """Get actual fill price from Hyperliquid position.
+
+    Args:
+        hl_client: Hyperliquid client
+        asset: Asset ticker
+
+    Returns:
+        Actual entry price from HL, or None if not found
+    """
+    try:
+        positions = hl_client.get_positions()
+        for pos in positions:
+            position_data = pos.get("position", {})
+            if position_data.get("coin") == asset:
+                entry_px = position_data.get("entryPx")
+                if entry_px:
+                    actual_price = float(entry_px)
+                    logger.info(f"Actual fill price from HL: {actual_price}")
+                    return actual_price
+        logger.warning(f"No position found for {asset} on HL")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to get actual fill price: {e}")
+        return None
 
 
 async def execute_signal(
@@ -211,105 +251,56 @@ async def execute_signal(
             position_size_usd, current_price, sz_decimals
         )
 
-        result = hl_client.market_open(signal.asset, is_buy, size_tokens)
-        logger.info(f"Market order executed: {result}")
-
-        tp_is_buy = not is_buy
-        tp_result = hl_client.limit_order(
-            signal.asset,
-            tp_is_buy,
-            size_tokens,
-            signal.take_profit,
-            reduce_only=True,
-        )
-        logger.info(f"TP limit order placed: {tp_result}")
-
-        position_id = save_position(
-            conn=db_conn,
-            signal_id=signal_id,
-            asset=signal.asset,
-            direction=signal.direction,
-            size_usd=position_size_usd,
-            size_tokens=size_tokens,
-            entry_price=current_price,
-            tp_price=signal.take_profit,
-            sl_price=signal.stop_loss,
-        )
-
-        cursor.execute(
-            "UPDATE signals SET status = 'executed' WHERE id = ?", (signal_id,)
-        )
-        db_conn.commit()
-
-        await telegram_app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                f"✅ {signal.asset} {signal.direction.upper()} Position Opened\n"
-                f"Entry: ${current_price:,.2f}\n"
-                f"Size: ${position_size_usd:.0f} ({size_tokens:.4f} tokens)\n"
-                f"TP: ${signal.take_profit:,.2f}\n"
-                f"SL: ${signal.stop_loss:,.2f}"
-            ),
-        )
-
-        logger.info(
-            f"Successfully executed signal {signal_id}, position_id={position_id}"
-        )
-        return position_id
-
-    except Exception as e:
-        logger.error(f"Failed to execute signal {signal_id}: {e}", exc_info=True)
-        await telegram_app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=f"⚠️ Execution failed for signal {signal_id}. Check logs.",
-        )
-        return None
-
-        signal = Signal(
-            asset=signal_row["asset"],
-            direction=signal_row["direction"],
-            entry_price=signal_row["entry"],
-            take_profit=signal_row["tp"],
-            stop_loss=signal_row["sl"],
-            win_rate=signal_row["win_rate"],
-            vol_spread_pct=signal_row["vol_spread"],
-            timestamp=datetime.fromisoformat(signal_row["timestamp"]),
-            percentiles_snapshot={},
-        )
-        signal.id = signal_id
-
-        logger.info(
-            f"EXECUTING: {signal.asset} {signal.direction.upper()}, "
-            f"Entry ${signal.entry_price:.2f}, Size ${position_size_usd:.0f}"
-        )
-
-        current_price = hl_client.get_mid_price(signal.asset)
-
-        existing_positions = get_open_positions(db_conn)
-        is_valid, reason = check_signal_validity(
-            signal, current_price, existing_positions
-        )
-
-        if not is_valid:
-            logger.warning(f"Signal execution failed: {reason}")
-            await telegram_app.bot.send_message(
-                chat_id=db_conn.execute(
-                    "SELECT value FROM config WHERE key='telegram_chat_id'"
-                ).fetchone()["value"],
-                text=f"⚠️ {signal.asset} {signal.direction.upper()} execution failed:\n{reason}",
+        if DRY_RUN:
+            logger.info(
+                f"DRY RUN: Would place {signal.asset} {signal.direction.upper()} "
+                f"market order for ${position_size_usd:.0f} ({size_tokens:.4f} tokens) "
+                f"at ~${current_price:.2f}"
             )
-            return None
 
-        is_buy = signal.direction == "long"
+            actual_fill_price = current_price
 
-        asset_meta = hl_client.get_asset_meta(signal.asset)
-        sz_decimals = asset_meta["szDecimals"]
-        size_tokens = calculate_position_size(
-            position_size_usd, current_price, sz_decimals
-        )
+            position_id = save_position(
+                conn=db_conn,
+                signal_id=signal_id,
+                asset=signal.asset,
+                direction=signal.direction,
+                size_usd=position_size_usd,
+                size_tokens=size_tokens,
+                entry_price=actual_fill_price,
+                tp_price=signal.take_profit,
+                sl_price=signal.stop_loss,
+            )
+
+            cursor.execute(
+                "UPDATE signals SET status = 'executed' WHERE id = ?", (signal_id,)
+            )
+            db_conn.commit()
+
+            await telegram_app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    f"🧪 DRY RUN: {signal.asset} {signal.direction.upper()} Order Simulated\n"
+                    f"Entry: ${actual_fill_price:,.2f}\n"
+                    f"Size: ${position_size_usd:.0f} ({size_tokens:.4f} tokens)\n"
+                    f"TP: ${signal.take_profit:,.2f}\n"
+                    f"SL: ${signal.stop_loss:,.2f}\n\n"
+                    f"⚠️ No order placed on Hyperliquid"
+                ),
+            )
+
+            logger.info(
+                f"DRY RUN: Simulated execution of signal {signal_id}, position_id={position_id}"
+            )
+            return position_id
 
         result = hl_client.market_open(signal.asset, is_buy, size_tokens)
         logger.info(f"Market order executed: {result}")
+
+        actual_fill_price = get_actual_fill_price(hl_client, signal.asset)
+        if actual_fill_price is None:
+            actual_fill_price = current_price
+            logger.warning(f"Using mid price as fill price: {actual_fill_price}")
 
         tp_is_buy = not is_buy
         tp_result = hl_client.limit_order(
@@ -328,7 +319,7 @@ async def execute_signal(
             direction=signal.direction,
             size_usd=position_size_usd,
             size_tokens=size_tokens,
-            entry_price=current_price,
+            entry_price=actual_fill_price,
             tp_price=signal.take_profit,
             sl_price=signal.stop_loss,
         )
@@ -339,12 +330,10 @@ async def execute_signal(
         db_conn.commit()
 
         await telegram_app.bot.send_message(
-            chat_id=db_conn.execute(
-                "SELECT value FROM config WHERE key='telegram_chat_id'"
-            ).fetchone()["value"],
+            chat_id=TELEGRAM_CHAT_ID,
             text=(
                 f"✅ {signal.asset} {signal.direction.upper()} Position Opened\n"
-                f"Entry: ${current_price:,.2f}\n"
+                f"Entry: ${actual_fill_price:,.2f}\n"
                 f"Size: ${position_size_usd:.0f} ({size_tokens:.4f} tokens)\n"
                 f"TP: ${signal.take_profit:,.2f}\n"
                 f"SL: ${signal.stop_loss:,.2f}"
@@ -359,9 +348,7 @@ async def execute_signal(
     except Exception as e:
         logger.error(f"Failed to execute signal {signal_id}: {e}", exc_info=True)
         await telegram_app.bot.send_message(
-            chat_id=db_conn.execute(
-                "SELECT value FROM config WHERE key='telegram_chat_id'"
-            ).fetchone()["value"],
+            chat_id=TELEGRAM_CHAT_ID,
             text=f"⚠️ Execution failed for signal {signal_id}. Check logs.",
         )
         return None
@@ -371,7 +358,7 @@ async def position_monitor(
     db_conn,
     hl_client: HLClient,
     telegram_app,
-    check_interval: int = 60,
+    check_interval: int = 30,
     update_interval: int = 300,
 ) -> None:
     """Monitor open positions and manage TP/SL.
@@ -380,19 +367,15 @@ async def position_monitor(
         db_conn: Database connection
         hl_client: Hyperliquid client
         telegram_app: Telegram bot application
-        check_interval: How often to check positions (seconds)
-        update_interval: How often to send P&L updates (seconds)
+        check_interval: How often to check positions (seconds, default 30)
+        update_interval: How often to send P&L updates (seconds, default 300 = 5 min)
     """
     logger.info("Starting position monitor loop")
-    last_update_time = datetime.utcnow()
+    last_update_times: Dict[int, datetime] = {}
 
     while True:
         try:
             now = datetime.utcnow()
-            should_send_update = (
-                now - last_update_time
-            ).total_seconds() >= update_interval
-
             positions = get_open_positions(db_conn)
 
             if not positions:
@@ -404,12 +387,13 @@ async def position_monitor(
 
             for position in positions:
                 try:
+                    position_id = position["id"]
                     asset = position["asset"]
                     direction = position["direction"]
-                    entry = position["entry_price"]
-                    tp_price = position["tp_price"]
-                    sl_price = position["sl_price"]
-                    size_usd = position["size_usd"]
+                    entry = float(position["entry_price"])
+                    tp_price = float(position["tp_price"])
+                    sl_price = float(position["sl_price"])
+                    size_usd = float(position["size_usd"])
 
                     current_price = hl_client.get_mid_price(asset)
                     pnl_usd, pnl_pct = calculate_pnl(
@@ -427,18 +411,24 @@ async def position_monitor(
                         logger.info(f"Closed position: {result}")
 
                         opened_at = datetime.fromisoformat(position["opened_at"])
-                        duration_min = (now - opened_at).total_seconds() / 60
+                        duration_min = int((now - opened_at).total_seconds() / 60)
 
                         update_position(
                             conn=db_conn,
-                            position_id=position["id"],
+                            position_id=position_id,
                             status="closed",
                             closed_at=now.isoformat(),
                             pnl=pnl_usd,
+                            exit_price=current_price,
+                            exit_reason=exit_reason,
                         )
 
+                        from db import get_signal_by_id
                         from chart_renderer import render_pnl_summary
                         from telegram_bot import send_close_summary
+
+                        signal_data = get_signal_by_id(db_conn, position["signal_id"])
+                        win_rate = signal_data["win_rate"] if signal_data else 0.0
 
                         chart_image = render_pnl_summary(
                             asset=asset,
@@ -447,7 +437,7 @@ async def position_monitor(
                             exit_price=current_price,
                             pnl_usd=pnl_usd,
                             pnl_pct=pnl_pct * 100,
-                            duration_min=int(duration_min),
+                            duration_min=duration_min,
                         )
 
                         await send_close_summary(
@@ -458,25 +448,38 @@ async def position_monitor(
                             exit_price=current_price,
                             pnl_usd=pnl_usd,
                             pnl_pct=pnl_pct * 100,
-                            duration_min=int(duration_min),
+                            duration_min=duration_min,
+                            win_rate=win_rate,
                             application=telegram_app,
                         )
 
-                    elif should_send_update:
-                        opened_at = datetime.fromisoformat(position["opened_at"])
-                        duration_min = (now - opened_at).total_seconds() / 60
+                        if position_id in last_update_times:
+                            del last_update_times[position_id]
 
-                        from telegram_bot import send_pnl_update
-
-                        await send_pnl_update(
-                            asset=asset,
-                            direction=direction,
-                            entry=entry,
-                            current_price=current_price,
-                            unrealized_pnl=pnl_usd,
-                            duration_min=int(duration_min),
-                            application=telegram_app,
+                    else:
+                        last_update = last_update_times.get(position_id)
+                        should_send_update = (
+                            last_update is None
+                            or (now - last_update).total_seconds() >= update_interval
                         )
+
+                        if should_send_update:
+                            opened_at = datetime.fromisoformat(position["opened_at"])
+                            duration_min = int((now - opened_at).total_seconds() / 60)
+
+                            from telegram_bot import send_pnl_update
+
+                            await send_pnl_update(
+                                asset=asset,
+                                direction=direction,
+                                entry=entry,
+                                current_price=current_price,
+                                pnl_usd=pnl_usd,
+                                pnl_pct=pnl_pct * 100,
+                                duration_min=duration_min,
+                                application=telegram_app,
+                            )
+                            last_update_times[position_id] = now
 
                 except Exception as e:
                     logger.error(
@@ -484,9 +487,6 @@ async def position_monitor(
                         exc_info=True,
                     )
                     continue
-
-            if should_send_update and positions:
-                last_update_time = now
 
         except Exception as e:
             logger.error(f"Error in position monitor loop: {e}", exc_info=True)
@@ -523,10 +523,9 @@ async def synth_poller(
 
             for asset in assets:
                 try:
-                    async with synth_client:
-                        percentile_data = await synth_client.get_prediction_percentiles(
-                            asset, horizon="1h"
-                        )
+                    percentile_data = await synth_client.get_prediction_percentiles(
+                        asset, horizon="1h"
+                    )
 
                     signal = evaluate_signal(asset, percentile_data)
 
@@ -537,9 +536,6 @@ async def synth_poller(
                         logger.info(
                             f"Generated signal: {asset} {signal.direction.upper()}"
                         )
-
-                        from hl_client import HLClient
-                        from config import HL_WALLET_ADDRESS, HL_PRIVATE_KEY, HL_TESTNET
 
                         hl_client = HLClient(
                             HL_WALLET_ADDRESS, HL_PRIVATE_KEY, HL_TESTNET

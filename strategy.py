@@ -153,6 +153,77 @@ def evaluate_signal(asset: str, percentile_data: Dict[str, Any]) -> Optional[Sig
     return None
 
 
+def evaluate_test_signal(asset: str, percentile_data: Dict[str, Any]) -> Signal:
+    """Evaluate test signal from prediction percentiles with relaxed thresholds.
+
+    LONG condition: percentile "0.50" > current_price (median above price)
+    SHORT condition: percentile "0.50" < current_price (median below price)
+    No cooldown checks for test signals.
+    Entry price = current_price from Synth response.
+
+    Args:
+        asset: Asset symbol
+        percentile_data: Response from prediction-percentiles endpoint
+
+    Returns:
+        Signal (always produces a signal)
+    """
+    current_price = percentile_data.get("current_price")
+    if not current_price:
+        logger.warning("No current_price in response")
+        raise ValueError("No current_price in percentile_data")
+
+    percentiles = percentile_data.get("forecast_future", {}).get("percentiles", [])
+    if not percentiles:
+        logger.warning("No percentiles in response")
+        raise ValueError("No percentiles in percentile_data")
+
+    final_percentiles = percentiles[-1]
+
+    now = datetime.utcnow()
+
+    p50 = final_percentiles.get("0.5")
+    p05 = final_percentiles.get("0.05")
+    p95 = final_percentiles.get("0.95")
+
+    if p50 > current_price:
+        direction = "long"
+        tp = p50
+        sl = p05
+        count_above = sum(
+            1
+            for key in PERCENTILE_KEYS
+            if final_percentiles.get(key, 0) > current_price
+        )
+        win_rate = count_above / len(PERCENTILE_KEYS)
+        logger.info(f"Test LONG signal generated for {asset} at ${current_price:.2f}")
+    else:
+        direction = "short"
+        tp = p50
+        sl = p95
+        count_below = sum(
+            1
+            for key in PERCENTILE_KEYS
+            if final_percentiles.get(key, float("inf")) < current_price
+        )
+        win_rate = count_below / len(PERCENTILE_KEYS)
+        logger.info(f"Test SHORT signal generated for {asset} at ${current_price:.2f}")
+
+    vol_spread = (p95 - p05) / current_price * 100
+
+    return Signal(
+        asset=asset,
+        direction=direction,
+        entry_price=current_price,
+        take_profit=tp,
+        stop_loss=sl,
+        win_rate=win_rate,
+        vol_spread_pct=vol_spread,
+        timestamp=now,
+        percentiles_snapshot=final_percentiles,
+    )
+
+
 def calculate_trade_stats(signal: Signal, position_size_usd: float) -> Dict[str, float]:
     """Calculate trade statistics.
 

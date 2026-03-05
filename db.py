@@ -171,7 +171,13 @@ def save_position(
 
 
 def update_position(
-    conn: sqlite3.Connection, position_id: int, status: str, closed_at: str, pnl: float
+    conn: sqlite3.Connection,
+    position_id: int,
+    status: str,
+    closed_at: str,
+    pnl: float,
+    exit_price: Optional[float] = None,
+    exit_reason: Optional[str] = None,
 ) -> None:
     """Update position status and PnL.
 
@@ -181,15 +187,17 @@ def update_position(
         status: New status
         closed_at: Closing timestamp
         pnl: Profit/loss
+        exit_price: Exit price (optional)
+        exit_reason: Reason for exit (optional)
     """
     cursor = conn.cursor()
     cursor.execute(
         """
         UPDATE positions
-        SET status = ?, closed_at = ?, pnl = ?
+        SET status = ?, closed_at = ?, pnl = ?, exit_price = ?, exit_reason = ?
         WHERE id = ?
         """,
-        (status, closed_at, pnl, position_id),
+        (status, closed_at, pnl, exit_price, exit_reason, position_id),
     )
     conn.commit()
 
@@ -265,3 +273,99 @@ def update_signal_status(conn: sqlite3.Connection, signal_id: int, status: str) 
     cursor.execute("UPDATE signals SET status = ? WHERE id = ?", (status, signal_id))
     conn.commit()
     logger.info(f"Updated signal {signal_id} status to {status}")
+
+
+def get_closed_positions(
+    conn: sqlite3.Connection, limit: int = 10
+) -> List[Dict[str, Any]]:
+    """Get last N closed positions.
+
+    Args:
+        conn: Database connection
+        limit: Maximum number of positions to return
+
+    Returns:
+        List of position dictionaries
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM positions
+        WHERE status = 'closed'
+        ORDER BY closed_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_position_stats(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Get all-time position statistics.
+
+    Args:
+        conn: Database connection
+
+    Returns:
+        Dict with total_pnl, win_count, total_count, avg_duration_min
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT 
+            COALESCE(SUM(pnl), 0) as total_pnl,
+            COUNT(*) as total_count,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as win_count
+        FROM positions
+        WHERE status = 'closed'
+        """
+    )
+
+    row = cursor.fetchone()
+    if not row or row["total_count"] == 0:
+        return {
+            "total_pnl": 0.0,
+            "win_count": 0,
+            "total_count": 0,
+            "avg_duration_min": 0,
+        }
+
+    cursor.execute(
+        """
+        SELECT AVG(
+            (julianday(closed_at) - julianday(opened_at)) * 24 * 60
+        ) as avg_duration
+        FROM positions
+        WHERE status = 'closed'
+        """
+    )
+
+    duration_row = cursor.fetchone()
+    avg_duration = duration_row["avg_duration"] if duration_row["avg_duration"] else 0
+
+    return {
+        "total_pnl": row["total_pnl"],
+        "win_count": row["win_count"],
+        "total_count": row["total_count"],
+        "avg_duration_min": int(avg_duration) if avg_duration else 0,
+    }
+
+
+def get_signal_by_id(
+    conn: sqlite3.Connection, signal_id: int
+) -> Optional[Dict[str, Any]]:
+    """Get signal by ID.
+
+    Args:
+        conn: Database connection
+        signal_id: Signal ID
+
+    Returns:
+        Signal dictionary or None
+    """
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
+    row = cursor.fetchone()
+    return dict(row) if row else None

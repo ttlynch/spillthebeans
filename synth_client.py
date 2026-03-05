@@ -7,9 +7,6 @@ from typing import Dict, Any, Optional
 
 import httpx
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
 
