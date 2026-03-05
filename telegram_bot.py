@@ -2,11 +2,24 @@
 
 import io
 import logging
+import time
 from datetime import datetime
 from typing import Dict, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from config import (
     TELEGRAM_BOT_TOKEN,
@@ -23,7 +36,12 @@ from db import (
     init_db,
     save_signal,
 )
-from strategy import Signal, calculate_trade_stats, evaluate_test_signal
+from strategy import (
+    Signal,
+    calculate_trade_stats,
+    evaluate_test_signal,
+    evaluate_signal,
+)
 from chart_renderer import (
     render_pnl_summary,
     render_signal_chart,
@@ -35,6 +53,15 @@ from execution import execute_signal, calculate_pnl
 logger = logging.getLogger(__name__)
 
 _selected_sizes: Dict[int, float] = {}
+_scan_cooldown_until: float = 0.0
+
+
+def _get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Get persistent reply keyboard."""
+    return ReplyKeyboardMarkup(
+        [["📊 Status", "📜 History"], ["💰 Balance", "⚡ Scan Now"]],
+        resize_keyboard=True,
+    )
 
 
 def _calculate_percentages(signal: Signal) -> tuple[float, float]:
@@ -123,6 +150,14 @@ async def send_signal_alert(
         logger.info(f"Sent signal alert for {signal.asset} {signal.direction}")
     except Exception as e:
         logger.error(f"Failed to send signal alert: {e}", exc_info=True)
+        try:
+            await application.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="⚠️ Failed to send signal chart. Check logs.",
+                reply_markup=_get_main_keyboard(),
+            )
+        except Exception:
+            pass
         raise
 
 
@@ -152,7 +187,9 @@ async def send_pnl_update(
     )
 
     try:
-        await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        await application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID, text=message, reply_markup=_get_main_keyboard()
+        )
         logger.info(f"Sent P&L update for {asset}")
     except Exception as e:
         logger.error(f"Failed to send P&L update: {e}", exc_info=True)
@@ -190,7 +227,10 @@ async def send_close_summary(
 
     try:
         await application.bot.send_photo(
-            chat_id=TELEGRAM_CHAT_ID, photo=pnl_chart, caption=caption
+            chat_id=TELEGRAM_CHAT_ID,
+            photo=pnl_chart,
+            caption=caption,
+            reply_markup=_get_main_keyboard(),
         )
         logger.info(f"Sent close summary for {asset}")
     except Exception as e:
@@ -305,7 +345,9 @@ async def handle_execute_callback(
         logger.error(f"Failed to execute signal {signal_id}: {e}", exc_info=True)
 
         await context.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text="⚠️ Execution failed. Check logs."
+            chat_id=TELEGRAM_CHAT_ID,
+            text="⚠️ Execution failed. Check logs.",
+            reply_markup=_get_main_keyboard(),
         )
 
 
@@ -350,6 +392,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/start - Show this message\n"
         "/status - View open positions\n"
         "/history - View last 10 signals\n"
+        "/balance - View account balance\n"
+        "/scan - Trigger immediate signal scan\n"
         "/test_signal [BTC|ETH|SOL] - Send test signal for asset (default: BTC)\n\n"
         "*How it works:*\n"
         "1. Bot analyzes Synth API predictions\n"
@@ -358,7 +402,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "4. Bot manages positions on Hyperliquid"
     )
 
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(
+        message, parse_mode="Markdown", reply_markup=_get_main_keyboard()
+    )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,19 +414,24 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     conn = context.application.bot_data.get("db_conn")
     if not conn:
-        await update.message.reply_text("⚠️ Database error. Check logs.")
+        await update.message.reply_text(
+            "⚠️ Database error. Check logs.", reply_markup=_get_main_keyboard()
+        )
         return
 
     hl_client = context.application.bot_data.get("hl_client")
     if not hl_client:
-        await update.message.reply_text("⚠️ Hyperliquid client not initialized.")
+        await update.message.reply_text(
+            "⚠️ Hyperliquid client not initialized.", reply_markup=_get_main_keyboard()
+        )
         return
 
     positions = get_open_positions(conn)
 
     if not positions:
         await update.message.reply_text(
-            "📊 No open positions.\nWatching BTC, ETH, SOL for signals..."
+            "📊 No open positions.\nWatching BTC, ETH, SOL for signals...",
+            reply_markup=_get_main_keyboard(),
         )
         return
 
@@ -409,7 +460,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Duration: {duration_min} minutes\n\n"
         )
 
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(
+        message, parse_mode="Markdown", reply_markup=_get_main_keyboard()
+    )
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -419,14 +472,18 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     conn = context.application.bot_data.get("db_conn")
     if not conn:
-        await update.message.reply_text("⚠️ Database error. Check logs.")
+        await update.message.reply_text(
+            "⚠️ Database error. Check logs.", reply_markup=_get_main_keyboard()
+        )
         return
 
     positions = get_closed_positions(conn, limit=10)
     stats = get_position_stats(conn)
 
     if not positions:
-        await update.message.reply_text("📜 No closed positions yet.")
+        await update.message.reply_text(
+            "📜 No closed positions yet.", reply_markup=_get_main_keyboard()
+        )
         return
 
     message = f"📜 Recent Closed Positions ({len(positions)})\n\n"
@@ -473,7 +530,9 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Avg Duration: {avg_duration} minutes"
     )
 
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(
+        message, parse_mode="Markdown", reply_markup=_get_main_keyboard()
+    )
 
 
 async def test_signal_command(
@@ -485,12 +544,16 @@ async def test_signal_command(
 
     conn = context.application.bot_data.get("db_conn")
     if not conn:
-        await update.message.reply_text("⚠️ Database error. Check logs.")
+        await update.message.reply_text(
+            "⚠️ Database error. Check logs.", reply_markup=_get_main_keyboard()
+        )
         return
 
     synth_client = context.application.bot_data.get("synth_client")
     if not synth_client:
-        await update.message.reply_text("⚠️ Synth client not initialized.")
+        await update.message.reply_text(
+            "⚠️ Synth client not initialized.", reply_markup=_get_main_keyboard()
+        )
         return
 
     allowed_assets = ["BTC", "ETH", "SOL"]
@@ -501,7 +564,8 @@ async def test_signal_command(
             asset = arg
         else:
             await update.message.reply_text(
-                f"⚠️ Invalid asset. Allowed: {', '.join(allowed_assets)}"
+                f"⚠️ Invalid asset. Allowed: {', '.join(allowed_assets)}",
+                reply_markup=_get_main_keyboard(),
             )
             return
 
@@ -509,14 +573,18 @@ async def test_signal_command(
         percentile_data = await synth_client.get_prediction_percentiles(asset, "1h")
     except Exception as e:
         logger.error(f"Failed to fetch Synth data: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ Failed to fetch Synth data.")
+        await update.message.reply_text(
+            "⚠️ Failed to fetch Synth data.", reply_markup=_get_main_keyboard()
+        )
         return
 
     try:
         signal = evaluate_test_signal(asset, percentile_data)
     except ValueError as e:
         logger.error(f"Failed to evaluate test signal: {e}", exc_info=True)
-        await update.message.reply_text(f"⚠️ Failed to evaluate signal: {e}")
+        await update.message.reply_text(
+            f"⚠️ Failed to evaluate signal: {e}", reply_markup=_get_main_keyboard()
+        )
         return
 
     signal_id = save_signal(conn, signal)
@@ -543,6 +611,142 @@ async def test_signal_command(
     )
 
 
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /balance command - show account balance."""
+    if not _validate_chat(update):
+        return
+
+    hl_client = context.application.bot_data.get("hl_client")
+    if not hl_client:
+        await update.message.reply_text(
+            "⚠️ Hyperliquid client not initialized.", reply_markup=_get_main_keyboard()
+        )
+        return
+
+    try:
+        user_state = hl_client.info.user_state(hl_client.wallet_address)
+        margin = user_state.get("marginSummary", {})
+
+        account_value = float(margin.get("accountValue", 0))
+        margin_used = float(margin.get("totalMarginUsed", 0))
+        withdrawable = float(margin.get("withdrawable", 0))
+
+        message = (
+            f"💰 Account Balance\n"
+            f"Total Value: ${account_value:,.2f}\n"
+            f"Margin Used: ${margin_used:,.2f}\n"
+            f"Available: ${withdrawable:,.2f}"
+        )
+
+        await update.message.reply_text(message, reply_markup=_get_main_keyboard())
+        logger.info(f"Sent balance info: account_value=${account_value:.2f}")
+
+    except Exception as e:
+        logger.error(f"Failed to fetch balance: {e}", exc_info=True)
+        await update.message.reply_text(
+            "⚠️ Failed to fetch balance. Check logs.", reply_markup=_get_main_keyboard()
+        )
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /scan command - trigger immediate signal scan."""
+    global _scan_cooldown_until
+
+    if not _validate_chat(update):
+        return
+
+    now = time.time()
+    if now < _scan_cooldown_until:
+        remaining = int(_scan_cooldown_until - now)
+        await update.message.reply_text(
+            f"⏳ Scan on cooldown. Try again in {remaining} seconds.",
+            reply_markup=_get_main_keyboard(),
+        )
+        return
+
+    conn = context.application.bot_data.get("db_conn")
+    if not conn:
+        await update.message.reply_text(
+            "⚠️ Database error. Check logs.", reply_markup=_get_main_keyboard()
+        )
+        return
+
+    synth_client = context.application.bot_data.get("synth_client")
+    if not synth_client:
+        await update.message.reply_text(
+            "⚠️ Synth client not initialized.", reply_markup=_get_main_keyboard()
+        )
+        return
+
+    _scan_cooldown_until = now + 60
+
+    assets = ["BTC", "ETH", "SOL"]
+    signals_found = []
+
+    await update.message.reply_text(
+        "⚡ Scanning BTC, ETH, SOL for signals...", reply_markup=_get_main_keyboard()
+    )
+
+    for asset in assets:
+        try:
+            percentile_data = await synth_client.get_prediction_percentiles(asset, "1h")
+            signal = evaluate_signal(asset, percentile_data)
+
+            if signal:
+                signal_id = save_signal(conn, signal, status="pending")
+                signal.id = signal_id
+
+                p05 = signal.percentiles_snapshot.get("0.05", signal.stop_loss)
+                p95 = signal.percentiles_snapshot.get("0.95", signal.take_profit)
+                percentile_band = (p05, p95)
+
+                candles = fetch_candles(asset, num_candles=60)
+                chart_image = render_signal_chart(
+                    candle_data=candles,
+                    signal=signal,
+                    percentile_band=percentile_band,
+                    asset=asset,
+                )
+
+                await send_signal_alert(
+                    signal,
+                    chart_image,
+                    default_size=100.0,
+                    application=context.application,
+                )
+                signals_found.append(signal)
+                logger.info(f"Scan found signal: {asset} {signal.direction.upper()}")
+
+        except Exception as e:
+            logger.error(f"Error scanning {asset}: {e}", exc_info=True)
+
+    if not signals_found:
+        await context.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="No signals right now. Watching BTC, ETH, SOL...",
+            reply_markup=_get_main_keyboard(),
+        )
+
+
+async def handle_button_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle persistent keyboard button presses."""
+    if not _validate_chat(update):
+        return
+
+    text = update.message.text
+
+    if text == "📊 Status":
+        await status_command(update, context)
+    elif text == "📜 History":
+        await history_command(update, context)
+    elif text == "💰 Balance":
+        await balance_command(update, context)
+    elif text == "⚡ Scan Now":
+        await scan_command(update, context)
+
+
 def create_bot(db_conn=None, hl_client=None, synth_client=None) -> Application:
     """Create and configure Telegram bot application."""
     if not TELEGRAM_BOT_TOKEN:
@@ -562,7 +766,13 @@ def create_bot(db_conn=None, hl_client=None, synth_client=None) -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("test_signal", test_signal_command))
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_text)
+    )
 
     application.add_handler(
         CallbackQueryHandler(handle_size_callback, pattern=r"^size:")
