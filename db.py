@@ -4,7 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -32,10 +32,16 @@ CREATE TABLE IF NOT EXISTS positions (
     asset TEXT NOT NULL,
     direction TEXT NOT NULL,
     size_usd REAL NOT NULL,
+    size_tokens REAL NOT NULL,
     entry_price REAL NOT NULL,
+    tp_price REAL NOT NULL,
+    sl_price REAL NOT NULL,
+    tp_order_id INTEGER,
     status TEXT DEFAULT 'open',
     opened_at TEXT NOT NULL,
     closed_at TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
     pnl REAL,
     FOREIGN KEY (signal_id) REFERENCES signals(id)
 );
@@ -113,7 +119,11 @@ def save_position(
     asset: str,
     direction: str,
     size_usd: float,
+    size_tokens: float,
     entry_price: float,
+    tp_price: float,
+    sl_price: float,
+    tp_order_id: Optional[int] = None,
 ) -> int:
     """Save position to database.
 
@@ -123,7 +133,11 @@ def save_position(
         asset: Asset symbol
         direction: "long" or "short"
         size_usd: Position size in USD
+        size_tokens: Position size in tokens
         entry_price: Entry price
+        tp_price: Take profit price
+        sl_price: Stop loss price
+        tp_order_id: Optional TP order ID
 
     Returns:
         position_id
@@ -132,15 +146,19 @@ def save_position(
     cursor.execute(
         """
         INSERT INTO positions
-        (signal_id, asset, direction, size_usd, entry_price, status, opened_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (signal_id, asset, direction, size_usd, size_tokens, entry_price, tp_price, sl_price, tp_order_id, status, opened_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             signal_id,
             asset,
             direction,
             size_usd,
+            size_tokens,
             entry_price,
+            tp_price,
+            sl_price,
+            tp_order_id,
             "open",
             datetime.utcnow().isoformat(),
         ),

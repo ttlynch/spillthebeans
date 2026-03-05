@@ -1,0 +1,29 @@
+# Python requirement: 3.10+
+# The hyperliquid-python-sdk uses Python 3.10+ type hint syntax (| operator)
+
+# Core dependencies
+python-dotenv==1.0.0
+hyperliquid-python-sdk>=0.2.0
+
+# Async HTTP client
+httpx~=0.25.2
+
+# Telegram bot
+python-telegram-bot==20.7
+
+# Data processing
+pandas~=2.2.0
+numpy==2.0.0
+
+# Charting
+matplotlib==3.10.0
+mplfinance==0.12.10b0
+
+# Type hints
+typing-extensions==4.9.0
+
+# Required for eth-account (needs older setuptools for pkg_resources)
+setuptools<70.0
+
+# Required for hyperliquid SDK
+requests

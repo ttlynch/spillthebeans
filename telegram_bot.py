@@ -8,7 +8,13 @@ from typing import Dict, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    HL_WALLET_ADDRESS,
+    HL_PRIVATE_KEY,
+    HL_TESTNET,
+)
 from db import get_open_positions, get_signal_history, init_db, save_signal
 from strategy import Signal, calculate_trade_stats
 from chart_renderer import (
@@ -16,6 +22,8 @@ from chart_renderer import (
     render_signal_chart,
     _generate_mock_candles,
 )
+from hl_client import HLClient
+from execution import execute_signal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -199,7 +207,7 @@ async def handle_size_callback(
 
     conn = context.application.bot_data.get("db_conn")
     if not conn:
-        await query.edit_message_text("⚠️ Database error. Check logs.")
+        await query.edit_message_caption(caption="⚠️ Database error. Check logs.")
         logger.error("No database connection in bot_data")
         return
 
@@ -208,7 +216,7 @@ async def handle_size_callback(
     ).fetchone()
 
     if not signal_row:
-        await query.edit_message_text("⚠️ Signal not found.")
+        await query.edit_message_caption(caption="⚠️ Signal not found.")
         return
 
     signal = Signal(
@@ -254,39 +262,35 @@ async def handle_execute_callback(
 
     conn = context.application.bot_data.get("db_conn")
     if not conn:
-        await query.edit_message_text("⚠️ Database error. Check logs.")
+        await query.edit_message_caption(caption="⚠️ Database error. Check logs.")
         logger.error("No database connection in bot_data")
         return
 
-    signal_row = conn.execute(
-        "SELECT * FROM signals WHERE id = ?", (signal_id,)
-    ).fetchone()
-
-    if not signal_row:
-        await query.edit_message_text("⚠️ Signal not found.")
-        return
-
     try:
-        logger.info(
-            f"EXECUTE REQUEST: Signal {signal_id}, {signal_row['asset']} {signal_row['direction']}, "
-            f"Entry ${signal_row['entry']:.2f}, Size ${size:.0f}"
+        logger.info(f"EXECUTE REQUEST: Signal {signal_id}, Size ${size:.0f}")
+
+        hl_client = context.application.bot_data.get("hl_client")
+        if not hl_client:
+            await query.edit_message_caption(
+                caption="⚠️ Hyperliquid client not initialized."
+            )
+            logger.error("No Hyperliquid client in bot_data")
+            return
+
+        position_id = await execute_signal(
+            signal_id=signal_id,
+            position_size_usd=size,
+            db_conn=conn,
+            hl_client=hl_client,
+            telegram_app=context.application,
         )
 
-        conn.execute(
-            "UPDATE signals SET status = 'executed' WHERE id = ?", (signal_id,)
-        )
-        conn.commit()
-
-        await context.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                f"✅ {signal_row['asset']} {signal_row['direction'].upper()} opened on Hyperliquid\n"
-                f"Entry: ${signal_row['entry']:,.2f}\n"
-                f"Size: ${size:.0f}"
-            ),
-        )
-
-        logger.info(f"Successfully executed signal {signal_id}")
+        if position_id:
+            logger.info(
+                f"Successfully executed signal {signal_id}, position_id={position_id}"
+            )
+        else:
+            await query.edit_message_caption(caption="⚠️ Execution failed. Check logs.")
 
     except Exception as e:
         logger.error(f"Failed to execute signal {signal_id}: {e}", exc_info=True)
@@ -427,12 +431,19 @@ async def test_signal_command(
         await update.message.reply_text("⚠️ Database error. Check logs.")
         return
 
+    hl_client = context.application.bot_data.get("hl_client")
+    if not hl_client:
+        await update.message.reply_text("⚠️ Hyperliquid client not initialized.")
+        return
+
+    entry_price = hl_client.get_mid_price("BTC")
+
     signal = Signal(
         asset="BTC",
         direction="long",
-        entry_price=87200.00,
-        take_profit=87650.00,
-        stop_loss=86400.00,
+        entry_price=entry_price,
+        take_profit=entry_price * 1.005,
+        stop_loss=entry_price * 0.99,
         win_rate=0.71,
         vol_spread_pct=1.8,
         timestamp=datetime.now(),
@@ -442,11 +453,12 @@ async def test_signal_command(
     signal_id = save_signal(conn, signal)
     signal.id = signal_id
 
-    candles = _generate_mock_candles(60, base_price=87200.00)
+    percentile_band = (entry_price * 0.99, entry_price * 1.01)
+    candles = _generate_mock_candles(60, base_price=entry_price)
     chart_image = render_signal_chart(
         candle_data=candles,
         signal=signal,
-        percentile_band=(86400.0, 88000.0),
+        percentile_band=percentile_band,
         asset="BTC",
     )
 
@@ -457,7 +469,7 @@ async def test_signal_command(
     )
 
 
-def create_bot(db_conn=None) -> Application:
+def create_bot(db_conn=None, hl_client=None) -> Application:
     """Create and configure Telegram bot application."""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN not configured")
@@ -466,6 +478,9 @@ def create_bot(db_conn=None) -> Application:
 
     if db_conn:
         application.bot_data["db_conn"] = db_conn
+
+    if hl_client:
+        application.bot_data["hl_client"] = hl_client
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
@@ -486,10 +501,10 @@ def create_bot(db_conn=None) -> Application:
     return application
 
 
-def run_bot(db_path: str = "data/trading.db") -> None:
+def run_bot(db_path: str = "data/trading.db", hl_client=None) -> None:
     """Initialize and run the bot."""
     conn = init_db(db_path)
-    application = create_bot(db_conn=conn)
+    application = create_bot(db_conn=conn, hl_client=hl_client)
 
     logger.info("Starting Telegram bot...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

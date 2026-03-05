@@ -15,6 +15,7 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 ASSETS: List[str] = ["BTC", "ETH", "SOL"]
+DEFAULT_POSITION_SIZE_USD: float = 100.0
 
 
 def validate_config() -> None:
