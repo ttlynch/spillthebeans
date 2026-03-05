@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Tuple, Optional, Dict, Any, Dict, Any
+from typing import Tuple, Optional, Dict, Any
 
 from hl_client import HLClient
 from strategy import Signal

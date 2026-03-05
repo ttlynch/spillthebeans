@@ -47,34 +47,10 @@ Position Monitor (every 60s, updates every 5 min)
    python3 --version  # Should be 3.10+
    ```
    The hyperliquid-python-sdk requires Python 3.10+ type hint syntax.
-3. **Quick Installation** (Recommended - uses automated script):
+3. Create virtual environment and install dependencies:
    ```bash
-   ./install.sh
-   ```
-   This script will:
-   - Clean up old venv
-   - Create new virtual environment
-   - Install all dependencies with Python 3.14-compatible versions
-   - Verify installation success
-4. **Manual Installation** (if script fails):
-   ```bash
-   # Create virtual environment
    python3 -m venv venv
-
-   # Activate it
    source venv/bin/activate
-
-   # Install dependencies
-   pip install -r requirements.txt
-   ```
-5. Configure environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys
-   ```
-   The hyperliquid-python-sdk requires Python 3.10+ for type hint syntax.
-3. Install dependencies:
-   ```bash
    pip install -r requirements.txt
    ```
 4. Configure environment variables:
@@ -194,18 +170,10 @@ Trade parameters:
 
 ## Testing
 
-Run component tests:
+Test individual components via Telegram using the `/test_signal` command, or run the bot in dry-run mode:
 ```bash
-python3 test_execution.py
+python3 main.py --dry-run
 ```
-
-This tests:
-- Position size calculation
-- P&L calculation (long and short)
-- Exit condition checking (TP/SL)
-- Signal validation
-- Hyperliquid client
-- Synth API client
 
 ## Troubleshooting
 
