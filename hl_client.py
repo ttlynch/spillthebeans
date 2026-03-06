@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import eth_account
+import requests
 from eth_account.signers.local import LocalAccount
 
 from hyperliquid.exchange import Exchange
@@ -32,8 +33,31 @@ class HLClient:
             f"Initializing HLClient for {wallet_address} on {'testnet' if testnet else 'mainnet'}"
         )
 
-        self.info = Info(base_url, skip_ws=True)
-        self.exchange = Exchange(self.account, base_url)
+        try:
+            self.info = Info(base_url, skip_ws=True)
+            meta_response = self.info.meta
+        except (IndexError, KeyError) as e:
+            logger.warning(
+                f"Info init failed ({e}), falling back to minimal info object. "
+                "This usually happens on testnet when spot market tokens are empty."
+            )
+            meta_response = requests.post(
+                f"{base_url}/info", json={"type": "meta"}
+            ).json()
+            self.info = object.__new__(Info)
+            self.info.base_url = base_url
+            self.info.session = requests.Session()
+            self.info.meta = meta_response
+            self.info.coin_to_asset = {
+                asset_info["name"]: i
+                for i, asset_info in enumerate(meta_response["universe"])
+            }
+            self.info.spot_meta = {"tokens": [], "universe": []}
+
+        empty_spot_meta = {"tokens": [], "universe": []}
+        self.exchange = Exchange(
+            self.account, base_url, meta=meta_response, spot_meta=empty_spot_meta
+        )
         self._asset_meta_cache: Dict[str, Dict[str, Any]] = {}
 
         logger.info("HLClient initialized successfully")
