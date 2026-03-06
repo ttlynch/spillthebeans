@@ -13,6 +13,7 @@ from config import (
 from db import init_db
 from hl_client import HLClient
 from synth_client import SynthClient
+from settings import SettingsManager
 from telegram_bot import create_bot
 from execution import synth_poller, position_monitor
 from logging_config import setup_logging
@@ -59,6 +60,9 @@ async def main():
     db_conn = init_db("data/trading.db")
     logger.info("Database initialized")
 
+    settings_manager = SettingsManager("data/trading.db")
+    logger.info("Settings manager initialized")
+
     hl_client = HLClient(HL_WALLET_ADDRESS, HL_PRIVATE_KEY, HL_TESTNET)
     logger.info(
         f"Hyperliquid client initialized on {'testnet' if HL_TESTNET else 'mainnet'}"
@@ -68,7 +72,10 @@ async def main():
     logger.info("Synth API client initialized")
 
     telegram_app = create_bot(
-        db_conn=db_conn, hl_client=hl_client, synth_client=synth_client
+        db_conn=db_conn,
+        hl_client=hl_client,
+        synth_client=synth_client,
+        settings_manager=settings_manager,
     )
     logger.info("Telegram bot initialized")
 
@@ -79,7 +86,9 @@ async def main():
 
     async with synth_client:
         tasks = [
-            asyncio.create_task(synth_poller(db_conn, synth_client, telegram_app)),
+            asyncio.create_task(
+                synth_poller(db_conn, synth_client, telegram_app, settings_manager)
+            ),
             asyncio.create_task(position_monitor(db_conn, hl_client, telegram_app)),
             asyncio.create_task(run_telegram_bot(telegram_app, allowed_updates=[])),
         ]

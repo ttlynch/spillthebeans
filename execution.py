@@ -503,7 +503,7 @@ async def synth_poller(
     db_conn,
     synth_client,
     telegram_app,
-    interval: int = 180,
+    settings_manager=None,
 ) -> None:
     """Poll Synth API for trading signals.
 
@@ -511,20 +511,36 @@ async def synth_poller(
         db_conn: Database connection
         synth_client: Synth API client
         telegram_app: Telegram bot application
-        interval: Polling interval in seconds (default 3 min)
+        settings_manager: SettingsManager instance (optional, for backward compatibility)
     """
     logger.info("Starting Synth API poller loop")
 
+    from settings import SettingsManager
     from strategy import evaluate_signal
     from db import save_signal
     from chart_renderer import fetch_candles, render_signal_chart
     from telegram_bot import send_signal_alert
 
-    assets = ["BTC", "ETH", "SOL"]
+    if settings_manager is None:
+        settings_manager = SettingsManager()
 
     while True:
         try:
-            logger.info(f"Polling Synth API for {len(assets)} assets")
+            settings_manager.reset_credits_if_new_cycle()
+
+            auto_scan = settings_manager.get("auto_scan")
+            if not auto_scan:
+                logger.info("Auto-scan disabled, waiting...")
+                await asyncio.sleep(10)
+                continue
+
+            assets = settings_manager.get_active_assets()
+            long_pct, short_pct = settings_manager.get_percentiles()
+            interval = settings_manager.get_optimal_poll_interval()
+
+            logger.info(
+                f"Polling Synth API for {len(assets)} assets, interval={interval}s"
+            )
 
             for asset in assets:
                 try:
@@ -532,7 +548,11 @@ async def synth_poller(
                         asset, horizon="1h"
                     )
 
-                    signal = evaluate_signal(asset, percentile_data)
+                    settings_manager.increment_credits_used(1)
+
+                    signal = evaluate_signal(
+                        asset, percentile_data, long_pct=long_pct, short_pct=short_pct
+                    )
 
                     if signal:
                         signal_id = save_signal(db_conn, signal, status="pending")

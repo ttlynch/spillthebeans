@@ -9,6 +9,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+SCHEMA_SETTINGS = """
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
 SCHEMA_SIGNALS = """
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +74,7 @@ def init_db(db_path: str = "data/trading.db") -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
 
     cursor = conn.cursor()
+    cursor.execute(SCHEMA_SETTINGS)
     cursor.execute(SCHEMA_SIGNALS)
     cursor.execute(SCHEMA_POSITIONS)
     conn.commit()

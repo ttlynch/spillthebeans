@@ -60,7 +60,7 @@ _scan_cooldown_until: float = 0.0
 def _get_main_keyboard() -> ReplyKeyboardMarkup:
     """Get persistent reply keyboard."""
     return ReplyKeyboardMarkup(
-        [["📊 Status", "📜 History"], ["💰 Balance", "⚡ Scan Now"]],
+        [["📊 Status", "📜 History"], ["💰 Balance", "⚡ Scan Now"], ["⚙️ Settings"]],
         resize_keyboard=True,
     )
 
@@ -683,17 +683,27 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     _scan_cooldown_until = now + 60
 
-    assets = ["BTC", "ETH", "SOL"]
+    settings = context.application.bot_data.get("settings_manager")
+    if settings:
+        assets = settings.get_active_assets()
+        long_pct, short_pct = settings.get_percentiles()
+    else:
+        assets = ["BTC", "ETH", "SOL"]
+        long_pct, short_pct = "0.35", "0.65"
+
     signals_found = []
 
     await update.message.reply_text(
-        "⚡ Scanning BTC, ETH, SOL for signals...", reply_markup=_get_main_keyboard()
+        f"⚡ Scanning {', '.join(assets)} for signals...",
+        reply_markup=_get_main_keyboard(),
     )
 
     for asset in assets:
         try:
             percentile_data = await synth_client.get_prediction_percentiles(asset, "1h")
-            signal = evaluate_signal(asset, percentile_data)
+            signal = evaluate_signal(
+                asset, percentile_data, long_pct=long_pct, short_pct=short_pct
+            )
 
             if signal:
                 signal_id = save_signal(conn, signal, status="pending")
@@ -726,7 +736,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not signals_found:
         await context.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="No signals right now. Watching BTC, ETH, SOL...",
+            text=f"No signals right now. Watching {', '.join(assets)}...",
             reply_markup=_get_main_keyboard(),
         )
 
@@ -748,9 +758,472 @@ async def handle_button_text(
         await balance_command(update, context)
     elif text == "⚡ Scan Now":
         await scan_command(update, context)
+    elif text == "⚙️ Settings":
+        await settings_command(update, context)
 
 
-def create_bot(db_conn=None, hl_client=None, synth_client=None) -> Application:
+def _build_settings_keyboard(settings) -> InlineKeyboardMarkup:
+    """Build the main settings menu keyboard."""
+    auto_scan = "ON" if settings.get("auto_scan") else "OFF"
+    auto_scan_icon = "📡" if settings.get("auto_scan") else "📵"
+
+    assets = settings.get_active_assets()
+    all_assets = ["BTC", "ETH", "SOL"]
+    asset_str = ", ".join(a for a in all_assets if a in assets)
+
+    risk_preset = settings.get("risk_preset")
+    risk_icon = {
+        "conservative": "🔒",
+        "moderate": "⚖️",
+        "aggressive": "🔥",
+        "custom": "🎯",
+    }.get(risk_preset, "🎯")
+    long_pct, short_pct = settings.get_percentiles()
+    risk_str = f"{risk_icon} {risk_preset.capitalize()} (p{long_pct.replace('0.', '')}/p{short_pct.replace('0.', '')})"
+
+    poll_override = settings.get("poll_interval_override")
+    if poll_override > 0:
+        interval_str = f"{poll_override // 60}m {poll_override % 60}s (manual)"
+    else:
+        optimal = settings.get_optimal_poll_interval()
+        interval_str = f"{optimal // 60}m {optimal % 60}s (auto)"
+
+    budget = settings.get_budget_summary()
+    reset_day = settings.get("synth_cycle_reset_day")
+    credits_remaining = budget["credits_total"] - budget["credits_used"]
+    budget_str = f"resets day {reset_day} | {credits_remaining:,}/{budget['credits_total']:,} remaining"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📡 Toggle Auto-Scan", callback_data="settings:autoscan"
+            )
+        ],
+        [InlineKeyboardButton("🪙 Select Assets", callback_data="settings:assets")],
+        [InlineKeyboardButton("🎯 Risk Tolerance", callback_data="settings:risk")],
+        [InlineKeyboardButton("⏱ Poll Interval", callback_data="settings:poll")],
+        [InlineKeyboardButton("📅 Synth Budget", callback_data="settings:budget")],
+        [InlineKeyboardButton("❌ Close", callback_data="settings:close")],
+    ]
+
+    message_text = (
+        f"⚙️ Settings\n\n"
+        f"{auto_scan_icon} Auto-Scan: {auto_scan}\n"
+        f"🪙 Assets: {asset_str}\n"
+        f"🎯 Risk: {risk_str}\n"
+        f"⏱ Poll Interval: {interval_str}\n"
+        f"📅 Synth Cycle: {budget_str}"
+    )
+
+    return message_text, InlineKeyboardMarkup(keyboard)
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle ⚙️ Settings button press."""
+    if not _validate_chat(update):
+        return
+
+    settings = context.application.bot_data.get("settings_manager")
+    if not settings:
+        await update.message.reply_text(
+            "⚠️ Settings not initialized.", reply_markup=_get_main_keyboard()
+        )
+        return
+
+    message_text, keyboard = _build_settings_keyboard(settings)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=message_text, reply_markup=keyboard
+        )
+    else:
+        await update.message.reply_text(text=message_text, reply_markup=keyboard)
+
+
+async def handle_settings_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle settings callback queries."""
+    if not _validate_chat(update):
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    settings = context.application.bot_data.get("settings_manager")
+    if not settings:
+        await query.edit_message_text("⚠️ Settings not initialized.")
+        return
+
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "close":
+        await query.edit_message_text("Settings closed.")
+        return
+
+    elif action == "autoscan":
+        current = settings.get("auto_scan")
+        settings.set("auto_scan", not current)
+        logger.info(f"Auto-scan toggled: {not current}")
+
+    elif action == "assets":
+        all_assets = ["BTC", "ETH", "SOL"]
+        current_assets = settings.get_active_assets()
+
+        keyboard = []
+        row = []
+        for asset in all_assets:
+            icon = "✅" if asset in current_assets else "❌"
+            row.append(
+                InlineKeyboardButton(
+                    f"{asset} {icon}", callback_data=f"settings:asset_toggle:{asset}"
+                )
+            )
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="settings:back")])
+
+        await query.edit_message_text(
+            "🪙 Select Assets (at least 1 required):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    elif action == "asset_toggle":
+        asset = parts[2] if len(parts) > 2 else ""
+        current_assets = settings.get_active_assets()
+
+        if asset in current_assets:
+            if len(current_assets) > 1:
+                current_assets.remove(asset)
+        else:
+            current_assets.append(asset)
+
+        import json
+
+        settings.set("assets", json.dumps(current_assets))
+        logger.info(f"Asset toggled: {asset}, now: {current_assets}")
+
+        all_assets_list = ["BTC", "ETH", "SOL"]
+        keyboard = []
+        row = []
+        for a in all_assets_list:
+            icon = "✅" if a in current_assets else "❌"
+            row.append(
+                InlineKeyboardButton(
+                    f"{a} {icon}", callback_data=f"settings:asset_toggle:{a}"
+                )
+            )
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="settings:back")])
+
+        await query.edit_message_text(
+            "🪙 Select Assets (at least 1 required):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    elif action == "risk":
+        current_preset = settings.get("risk_preset")
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"🔒 Conservative (p35/p65){' ✓' if current_preset == 'conservative' else ''}",
+                    callback_data="settings:risk_preset:conservative",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"⚖️ Moderate (p45/p55){' ✓' if current_preset == 'moderate' else ''}",
+                    callback_data="settings:risk_preset:moderate",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🔥 Aggressive (p50/p50){' ✓' if current_preset == 'aggressive' else ''}",
+                    callback_data="settings:risk_preset:aggressive",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🎯 Custom...{' ✓' if current_preset == 'custom' else ''}",
+                    callback_data="settings:risk_custom",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings:back")],
+        ]
+
+        await query.edit_message_text(
+            "🎯 Select Risk Tolerance:", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif action == "risk_preset":
+        preset = parts[2] if len(parts) > 2 else "conservative"
+        long_pct, short_pct = {
+            "conservative": ("0.35", "0.65"),
+            "moderate": ("0.45", "0.55"),
+            "aggressive": ("0.50", "0.50"),
+        }.get(preset, ("0.35", "0.65"))
+
+        settings.set("risk_preset", preset)
+        settings.set("long_percentile", long_pct)
+        settings.set("short_percentile", short_pct)
+        logger.info(f"Risk preset set to {preset}: long={long_pct}, short={short_pct}")
+
+    elif action == "risk_custom":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Enter two percentile values (e.g., 0.40 0.60):\n\nFirst value is for LONG signals, second for SHORT.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Cancel", callback_data="settings:back")]]
+            ),
+        )
+        context.user_data["waiting_for_custom_risk"] = True
+        return
+
+    elif action == "poll":
+        poll_override = settings.get("poll_interval_override")
+        optimal = settings.get_optimal_poll_interval()
+
+        daily_budget = settings.get_budget_summary()["daily_budget"]
+        assets_count = len(settings.get_active_assets())
+        polls_per_day = daily_budget / assets_count if daily_budget > 0 else 0
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"Auto (recommended) {'✓' if poll_override == 0 else ''}",
+                    callback_data="settings:poll_auto",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Every 2 min {'✓' if poll_override == 120 else ''}",
+                    callback_data="settings:poll_manual:120",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Every 3 min {'✓' if poll_override == 180 else ''}",
+                    callback_data="settings:poll_manual:180",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Every 5 min {'✓' if poll_override == 300 else ''}",
+                    callback_data="settings:poll_manual:300",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Every 10 min {'✓' if poll_override == 600 else ''}",
+                    callback_data="settings:poll_manual:600",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings:back")],
+        ]
+
+        message = (
+            f"⏱ Poll Interval\n"
+            f"Current: {poll_override // 60}m {poll_override % 60}s "
+            f"({'auto-calculated' if poll_override == 0 else 'manual'})\n"
+            f"Based on: {daily_budget:.0f} daily budget ÷ {assets_count} assets = {polls_per_day:.0f} polls/day"
+        )
+
+        await query.edit_message_text(
+            message, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif action == "poll_auto":
+        settings.set("poll_interval_override", 0)
+        logger.info("Poll interval set to auto")
+
+    elif action == "poll_manual":
+        interval = int(parts[2]) if len(parts) > 2 else 300
+        settings.set("poll_interval_override", interval)
+        logger.info(f"Poll interval set to {interval}s")
+
+    elif action == "budget":
+        budget = settings.get_budget_summary()
+        reset_day = settings.get("synth_cycle_reset_day")
+
+        will_exceed = (
+            "✅ within budget" if not budget["will_exceed"] else "⚠️ will exceed"
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "Edit Total Credits", callback_data="settings:budget_edit_total"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Edit Reset Day", callback_data="settings:budget_edit_day"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Reset Used Credits", callback_data="settings:budget_reset_used"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings:back")],
+        ]
+
+        message = (
+            f"📅 Synth API Budget\n\n"
+            f"Total credits: {budget['credits_total']:,}\n"
+            f"Used this cycle: {budget['credits_used']:,}\n"
+            f"Remaining: {budget['credits_total'] - budget['credits_used']:,}\n"
+            f"Cycle resets: day {reset_day} of each month\n"
+            f"Daily budget: ~{budget['daily_budget']:.0f}/day\n"
+            f"Projected: {budget['projected_total_usage']:.0f} total ({will_exceed})"
+        )
+
+        await query.edit_message_text(
+            message, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif action == "budget_edit_total":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Enter new total credit limit (e.g., 20000):",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Cancel", callback_data="settings:back")]]
+            ),
+        )
+        context.user_data["waiting_for_budget_total"] = True
+        return
+
+    elif action == "budget_edit_day":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Enter day of month for cycle reset (1-28):",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Cancel", callback_data="settings:back")]]
+            ),
+        )
+        context.user_data["waiting_for_reset_day"] = True
+        return
+
+    elif action == "budget_reset_used":
+        settings.set("synth_credits_used", 0)
+        settings.set("_last_credits_reset", datetime.utcnow().strftime("%Y-%m-%d"))
+        logger.info("Credits used reset to 0")
+        budget = settings.get_budget_summary()
+        await query.answer("Credits reset to 0", show_alert=True)
+
+    elif action == "back":
+        message_text, keyboard = _build_settings_keyboard(settings)
+        await query.edit_message_text(text=message_text, reply_markup=keyboard)
+        return
+
+    message_text, keyboard = _build_settings_keyboard(settings)
+    await query.edit_message_text(text=message_text, reply_markup=keyboard)
+
+
+async def handle_settings_text_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle text input for custom settings."""
+    settings = context.application.bot_data.get("settings_manager")
+    if not settings:
+        await handle_button_text(update, context)
+        return
+
+    if not _validate_chat(update):
+        return
+
+    text = update.message.text
+
+    if context.user_data.get("waiting_for_custom_risk"):
+        context.user_data.pop("waiting_for_custom_risk", None)
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                long_pct = str(float(parts[0]))
+                short_pct = str(float(parts[1]))
+                settings.set("risk_preset", "custom")
+                settings.set("long_percentile", long_pct)
+                settings.set("short_percentile", short_pct)
+                logger.info(f"Custom risk set: long={long_pct}, short={short_pct}")
+                await update.message.reply_text(
+                    f"✅ Custom percentiles set: LONG p{long_pct}, SHORT p{short_pct}",
+                    reply_markup=_get_main_keyboard(),
+                )
+            except ValueError:
+                await update.message.reply_text(
+                    "⚠️ Invalid values. Use format: 0.40 0.60",
+                    reply_markup=_get_main_keyboard(),
+                )
+        else:
+            await update.message.reply_text(
+                "⚠️ Enter two numbers (e.g., 0.40 0.60)",
+                reply_markup=_get_main_keyboard(),
+            )
+        return
+
+    if context.user_data.get("waiting_for_budget_total"):
+        context.user_data.pop("waiting_for_budget_total", None)
+        try:
+            total = int(text)
+            if total > 0:
+                settings.set("synth_credits_total", total)
+                logger.info(f"Budget total set to {total}")
+                await update.message.reply_text(
+                    f"✅ Total credits set to {total:,}",
+                    reply_markup=_get_main_keyboard(),
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Must be a positive number.", reply_markup=_get_main_keyboard()
+                )
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Enter a valid number.", reply_markup=_get_main_keyboard()
+            )
+        return
+
+    if context.user_data.get("waiting_for_reset_day"):
+        context.user_data.pop("waiting_for_reset_day", None)
+        try:
+            day = int(text)
+            if 1 <= day <= 28:
+                settings.set("synth_cycle_reset_day", day)
+                logger.info(f"Reset day set to {day}")
+                await update.message.reply_text(
+                    f"✅ Cycle reset day set to {day}",
+                    reply_markup=_get_main_keyboard(),
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Enter a day between 1 and 28.", reply_markup=_get_main_keyboard()
+                )
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Enter a valid number.", reply_markup=_get_main_keyboard()
+            )
+        return
+
+    # No pending input, fall through to regular button text handler
+    await handle_button_text(update, context)
+
+
+def create_bot(
+    db_conn=None, hl_client=None, synth_client=None, settings_manager=None
+) -> Application:
     """Create and configure Telegram bot application."""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN not configured")
@@ -766,12 +1239,19 @@ def create_bot(db_conn=None, hl_client=None, synth_client=None) -> Application:
     if synth_client:
         application.bot_data["synth_client"] = synth_client
 
+    if settings_manager:
+        application.bot_data["settings_manager"] = settings_manager
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("test_signal", test_signal_command))
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_text_input)
+    )
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_text)
@@ -785,6 +1265,10 @@ def create_bot(db_conn=None, hl_client=None, synth_client=None) -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(handle_pass_callback, pattern=r"^pass:")
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(handle_settings_callback, pattern=r"^settings:")
     )
 
     logger.info("Telegram bot application created")

@@ -29,11 +29,16 @@ class Signal:
     id: Optional[int] = None
 
 
-def evaluate_signal(asset: str, percentile_data: Dict[str, Any]) -> Optional[Signal]:
+def evaluate_signal(
+    asset: str,
+    percentile_data: Dict[str, Any],
+    long_pct: str = "0.35",
+    short_pct: str = "0.65",
+) -> Optional[Signal]:
     """Evaluate signal from prediction percentiles.
 
-    LONG condition: percentile "0.35" > current_price
-    SHORT condition: percentile "0.65" < current_price
+    LONG condition: percentile long_pct > current_price (default "0.35")
+    SHORT condition: percentile short_pct < current_price (default "0.65")
     TP: percentile "0.5" (median at 1h)
     SL: percentile "0.05" for longs, "0.95" for shorts
     Win rate: count how many of [0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95]
@@ -43,6 +48,8 @@ def evaluate_signal(asset: str, percentile_data: Dict[str, Any]) -> Optional[Sig
     Args:
         asset: Asset symbol
         percentile_data: Response from prediction-percentiles endpoint
+        long_pct: Percentile key for long trigger (default "0.35")
+        short_pct: Percentile key for short trigger (default "0.65")
 
     Returns:
         Signal if conditions met, None otherwise
@@ -61,8 +68,8 @@ def evaluate_signal(asset: str, percentile_data: Dict[str, Any]) -> Optional[Sig
 
     now = datetime.utcnow()
 
-    p35 = final_percentiles.get("0.35")
-    if p35 and p35 > current_price:
+    p_long = final_percentiles.get(long_pct)
+    if p_long and p_long > current_price:
         direction = "long"
         cooldown_key = f"{asset}_{direction}"
 
@@ -105,8 +112,8 @@ def evaluate_signal(asset: str, percentile_data: Dict[str, Any]) -> Optional[Sig
             percentiles_snapshot=final_percentiles,
         )
 
-    p65 = final_percentiles.get("0.65")
-    if p65 and p65 < current_price:
+    p_short = final_percentiles.get(short_pct)
+    if p_short and p_short < current_price:
         direction = "short"
         cooldown_key = f"{asset}_{direction}"
 
