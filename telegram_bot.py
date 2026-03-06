@@ -1,5 +1,6 @@
 """Telegram bot for trading signal alerts and execution."""
 
+import asyncio
 import io
 import logging
 import time
@@ -443,7 +444,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         entry = float(pos["entry_price"])
         size_usd = float(pos["size_usd"])
 
-        current_price = hl_client.get_mid_price(asset)
+        current_price = await asyncio.to_thread(hl_client.get_mid_price, asset)
         pnl_usd, pnl_pct = calculate_pnl(direction, size_usd, entry, current_price)
 
         opened_at = datetime.fromisoformat(pos["opened_at"])
@@ -624,7 +625,9 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        user_state = hl_client.info.user_state(hl_client.wallet_address)
+        user_state = await asyncio.to_thread(
+            hl_client.info.user_state, hl_client.wallet_address
+        )
         margin = user_state.get("marginSummary", {})
 
         account_value = float(margin.get("accountValue", 0))

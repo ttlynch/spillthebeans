@@ -152,7 +152,7 @@ def check_signal_validity(
     return True, ""
 
 
-def get_actual_fill_price(hl_client: HLClient, asset: str) -> Optional[float]:
+async def get_actual_fill_price(hl_client: HLClient, asset: str) -> Optional[float]:
     """Get actual fill price from Hyperliquid position.
 
     Args:
@@ -163,7 +163,7 @@ def get_actual_fill_price(hl_client: HLClient, asset: str) -> Optional[float]:
         Actual entry price from HL, or None if not found
     """
     try:
-        positions = hl_client.get_positions()
+        positions = await asyncio.to_thread(hl_client.get_positions)
         for pos in positions:
             position_data = pos.get("position", {})
             if position_data.get("coin") == asset:
@@ -228,7 +228,7 @@ async def execute_signal(
             f"Entry ${signal.entry_price:.2f}, Size ${position_size_usd:.0f}"
         )
 
-        current_price = hl_client.get_mid_price(signal.asset)
+        current_price = await asyncio.to_thread(hl_client.get_mid_price, signal.asset)
 
         existing_positions = get_open_positions(db_conn)
         is_valid, reason = check_signal_validity(
@@ -245,7 +245,7 @@ async def execute_signal(
 
         is_buy = signal.direction == "long"
 
-        asset_meta = hl_client.get_asset_meta(signal.asset)
+        asset_meta = await asyncio.to_thread(hl_client.get_asset_meta, signal.asset)
         sz_decimals = asset_meta["szDecimals"]
         size_tokens = calculate_position_size(
             position_size_usd, current_price, sz_decimals
@@ -294,16 +294,19 @@ async def execute_signal(
             )
             return position_id
 
-        result = hl_client.market_open(signal.asset, is_buy, size_tokens)
+        result = await asyncio.to_thread(
+            hl_client.market_open, signal.asset, is_buy, size_tokens
+        )
         logger.info(f"Market order executed: {result}")
 
-        actual_fill_price = get_actual_fill_price(hl_client, signal.asset)
+        actual_fill_price = await get_actual_fill_price(hl_client, signal.asset)
         if actual_fill_price is None:
             actual_fill_price = current_price
             logger.warning(f"Using mid price as fill price: {actual_fill_price}")
 
         tp_is_buy = not is_buy
-        tp_result = hl_client.limit_order(
+        tp_result = await asyncio.to_thread(
+            hl_client.limit_order,
             signal.asset,
             tp_is_buy,
             size_tokens,
@@ -395,7 +398,9 @@ async def position_monitor(
                     sl_price = float(position["sl_price"])
                     size_usd = float(position["size_usd"])
 
-                    current_price = hl_client.get_mid_price(asset)
+                    current_price = await asyncio.to_thread(
+                        hl_client.get_mid_price, asset
+                    )
                     pnl_usd, pnl_pct = calculate_pnl(
                         direction, size_usd, entry, current_price
                     )
@@ -407,7 +412,7 @@ async def position_monitor(
                             f"Exit condition triggered for {asset}: {exit_reason}"
                         )
 
-                        result = hl_client.market_close(asset)
+                        result = await asyncio.to_thread(hl_client.market_close, asset)
                         logger.info(f"Closed position: {result}")
 
                         opened_at = datetime.fromisoformat(position["opened_at"])
