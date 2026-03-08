@@ -18,6 +18,8 @@ DEFAULTS = {
     "synth_credits_used": 0,
     "synth_cycle_reset_day": 1,
     "poll_interval_override": 0,
+    "multi_horizon": False,
+    "secondary_horizon": "24h",
 }
 
 RISK_PRESETS = {
@@ -146,7 +148,8 @@ class SettingsManager:
         daily_budget = (credits_total - credits_used) / days_remaining
 
         assets = self.get_active_assets()
-        calls_per_poll = len(assets)
+        multi_horizon = self.get("multi_horizon")
+        calls_per_poll = len(assets) * 2 if multi_horizon else len(assets)
 
         if daily_budget <= 0:
             return 900

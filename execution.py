@@ -220,6 +220,7 @@ async def execute_signal(
             vol_spread_pct=signal_row["vol_spread"],
             timestamp=datetime.fromisoformat(signal_row["timestamp"]),
             percentiles_snapshot={},
+            strength=signal_row.get("strength", 0),
         )
         signal.id = signal_id
 
@@ -516,7 +517,7 @@ async def synth_poller(
     logger.info("Starting Synth API poller loop")
 
     from settings import SettingsManager
-    from strategy import evaluate_signal
+    from strategy import evaluate_signal, evaluate_signal_multi_horizon
     from db import save_signal
     from chart_renderer import fetch_candles, render_signal_chart
     from telegram_bot import send_signal_alert
@@ -537,29 +538,54 @@ async def synth_poller(
             assets = settings_manager.get_active_assets()
             long_pct, short_pct = settings_manager.get_percentiles()
             interval = settings_manager.get_optimal_poll_interval()
+            multi_horizon = settings_manager.get("multi_horizon")
+            secondary_horizon = settings_manager.get("secondary_horizon")
 
             logger.info(
-                f"Polling Synth API for {len(assets)} assets, interval={interval}s"
+                f"Polling Synth API for {len(assets)} assets, interval={interval}s, "
+                f"multi_horizon={multi_horizon}"
             )
 
             for asset in assets:
                 try:
-                    percentile_data = await synth_client.get_prediction_percentiles(
-                        asset, horizon="1h"
-                    )
+                    if multi_horizon:
+                        data_1h = await synth_client.get_prediction_percentiles(
+                            asset, horizon="1h"
+                        )
+                        data_secondary = await synth_client.get_prediction_percentiles(
+                            asset, horizon=secondary_horizon
+                        )
 
-                    settings_manager.increment_credits_used(1)
+                        settings_manager.increment_credits_used(2)
 
-                    signal = evaluate_signal(
-                        asset, percentile_data, long_pct=long_pct, short_pct=short_pct
-                    )
+                        signal = evaluate_signal_multi_horizon(
+                            asset,
+                            data_1h,
+                            data_secondary,
+                            long_pct=long_pct,
+                            short_pct=short_pct,
+                        )
+                    else:
+                        percentile_data = await synth_client.get_prediction_percentiles(
+                            asset, horizon="1h"
+                        )
+
+                        settings_manager.increment_credits_used(1)
+
+                        signal = evaluate_signal(
+                            asset,
+                            percentile_data,
+                            long_pct=long_pct,
+                            short_pct=short_pct,
+                        )
 
                     if signal:
                         signal_id = save_signal(db_conn, signal, status="pending")
                         signal.id = signal_id
 
                         logger.info(
-                            f"Generated signal: {asset} {signal.direction.upper()}"
+                            f"Generated signal: {asset} {signal.direction.upper()} "
+                            f"(strength={signal.strength}, multi_horizon={multi_horizon})"
                         )
 
                         hl_client = HLClient(

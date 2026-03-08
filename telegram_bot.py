@@ -42,6 +42,7 @@ from strategy import (
     calculate_trade_stats,
     evaluate_test_signal,
     evaluate_signal,
+    strength_to_dots,
 )
 from chart_renderer import (
     render_pnl_summary,
@@ -80,6 +81,7 @@ def _format_signal_caption(signal: Signal, size: float) -> str:
     """Format signal alert caption with trade stats."""
     tp_pct, sl_pct = _calculate_percentages(signal)
     stats = calculate_trade_stats(signal, size)
+    strength_dots = strength_to_dots(signal.strength)
 
     return (
         f"🔔 {signal.asset} {signal.direction.upper()} Signal\n"
@@ -87,6 +89,7 @@ def _format_signal_caption(signal: Signal, size: float) -> str:
         f"Take Profit: ${signal.take_profit:,.2f} ({tp_pct:+.2f}%)\n"
         f"Stop Loss: ${signal.stop_loss:,.2f} ({sl_pct:+.2f}%)\n"
         f"Win Rate: {signal.win_rate:.0%}\n"
+        f"Strength: {signal.strength}/100 {strength_dots}\n"
         f"💰 ${size:.0f} position:\n"
         f"Expected Profit: ${stats['expected_profit']:.2f}\n"
         f"Max Loss: ${stats['max_loss']:.2f}"
@@ -279,6 +282,7 @@ async def handle_size_callback(
         vol_spread_pct=signal_row["vol_spread"],
         timestamp=datetime.fromisoformat(signal_row["timestamp"]),
         percentiles_snapshot={},
+        strength=signal_row.get("strength", 0),
     )
     signal.id = signal_id
 
@@ -579,8 +583,16 @@ async def test_signal_command(
         )
         return
 
+    settings = context.application.bot_data.get("settings_manager")
+    if settings:
+        long_pct, short_pct = settings.get_percentiles()
+    else:
+        long_pct, short_pct = "0.35", "0.65"
+
     try:
-        signal = evaluate_test_signal(asset, percentile_data)
+        signal = evaluate_test_signal(
+            asset, percentile_data, long_pct=long_pct, short_pct=short_pct
+        )
     except ValueError as e:
         logger.error(f"Failed to evaluate test signal: {e}", exc_info=True)
         await update.message.reply_text(
@@ -793,6 +805,9 @@ def _build_settings_keyboard(settings) -> InlineKeyboardMarkup:
     credits_remaining = budget["credits_total"] - budget["credits_used"]
     budget_str = f"resets day {reset_day} | {credits_remaining:,}/{budget['credits_total']:,} remaining"
 
+    multi_horizon = "ON" if settings.get("multi_horizon") else "OFF"
+    multi_horizon_icon = "📊" if settings.get("multi_horizon") else "📊"
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -801,6 +816,12 @@ def _build_settings_keyboard(settings) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("🪙 Select Assets", callback_data="settings:assets")],
         [InlineKeyboardButton("🎯 Risk Tolerance", callback_data="settings:risk")],
+        [
+            InlineKeyboardButton(
+                f"📊 Multi-Horizon: {multi_horizon}",
+                callback_data="settings:multi_horizon",
+            )
+        ],
         [InlineKeyboardButton("⏱ Poll Interval", callback_data="settings:poll")],
         [InlineKeyboardButton("📅 Synth Budget", callback_data="settings:budget")],
         [InlineKeyboardButton("❌ Close", callback_data="settings:close")],
@@ -811,6 +832,7 @@ def _build_settings_keyboard(settings) -> InlineKeyboardMarkup:
         f"{auto_scan_icon} Auto-Scan: {auto_scan}\n"
         f"🪙 Assets: {asset_str}\n"
         f"🎯 Risk: {risk_str}\n"
+        f"{multi_horizon_icon} Multi-Horizon: {multi_horizon}\n"
         f"⏱ Poll Interval: {interval_str}\n"
         f"📅 Synth Cycle: {budget_str}"
     )
@@ -866,6 +888,14 @@ async def handle_settings_callback(
         current = settings.get("auto_scan")
         settings.set("auto_scan", not current)
         logger.info(f"Auto-scan toggled: {not current}")
+
+    elif action == "multi_horizon":
+        current = settings.get("multi_horizon")
+        settings.set("multi_horizon", not current)
+        new_state = not current
+        horizon_msg = "1h + 4h confirmation" if new_state else "OFF"
+        logger.info(f"Multi-horizon toggled: {new_state}")
+        await query.answer(f"Multi-horizon: {horizon_msg}", show_alert=True)
 
     elif action == "assets":
         all_assets = ["BTC", "ETH", "SOL"]
