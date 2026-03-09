@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS signals (
     vol_spread REAL NOT NULL,
     timestamp TEXT NOT NULL,
     status TEXT DEFAULT 'pending',
-    percentiles_snapshot TEXT
+    percentiles_snapshot TEXT,
+    strength INTEGER DEFAULT 0
 );
 """
 
@@ -77,6 +78,13 @@ def init_db(db_path: str = "data/trading.db") -> sqlite3.Connection:
     cursor.execute(SCHEMA_SETTINGS)
     cursor.execute(SCHEMA_SIGNALS)
     cursor.execute(SCHEMA_POSITIONS)
+
+    try:
+        cursor.execute("SELECT strength FROM signals LIMIT 1")
+    except sqlite3.OperationalError:
+        cursor.execute("ALTER TABLE signals ADD COLUMN strength INTEGER DEFAULT 0")
+        logger.info("Added strength column to signals table")
+
     conn.commit()
 
     logger.info("Database initialized successfully")
@@ -98,8 +106,8 @@ def save_signal(conn: sqlite3.Connection, signal, status: str = "pending") -> in
     cursor.execute(
         """
         INSERT INTO signals 
-        (asset, direction, entry, tp, sl, win_rate, vol_spread, timestamp, status, percentiles_snapshot)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (asset, direction, entry, tp, sl, win_rate, vol_spread, timestamp, status, percentiles_snapshot, strength)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             signal.asset,
@@ -112,6 +120,7 @@ def save_signal(conn: sqlite3.Connection, signal, status: str = "pending") -> in
             signal.timestamp.isoformat(),
             status,
             json.dumps(signal.percentiles_snapshot),
+            getattr(signal, "strength", 0),
         ),
     )
     conn.commit()

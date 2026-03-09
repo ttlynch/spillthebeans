@@ -220,6 +220,7 @@ async def execute_signal(
             vol_spread_pct=signal_row["vol_spread"],
             timestamp=datetime.fromisoformat(signal_row["timestamp"]),
             percentiles_snapshot={},
+            strength=signal_row.get("strength", 0),
         )
         signal.id = signal_id
 
@@ -376,140 +377,127 @@ async def position_monitor(
     logger.info("Starting position monitor loop")
     last_update_times: Dict[int, datetime] = {}
 
-    try:
-        while True:
-            try:
-                now = datetime.utcnow()
-                positions = get_open_positions(db_conn)
+    while True:
+        try:
+            now = datetime.utcnow()
+            positions = get_open_positions(db_conn)
 
-                if not positions:
-                    logger.debug("No open positions to monitor")
-                    await asyncio.sleep(check_interval)
-                    continue
+            if not positions:
+                logger.debug("No open positions to monitor")
+                await asyncio.sleep(check_interval)
+                continue
 
-                logger.info(f"Monitoring {len(positions)} open positions")
+            logger.info(f"Monitoring {len(positions)} open positions")
 
-                for position in positions:
-                    try:
-                        position_id = position["id"]
-                        asset = position["asset"]
-                        direction = position["direction"]
-                        entry = float(position["entry_price"])
-                        tp_price = float(position["tp_price"])
-                        sl_price = float(position["sl_price"])
-                        size_usd = float(position["size_usd"])
+            for position in positions:
+                try:
+                    position_id = position["id"]
+                    asset = position["asset"]
+                    direction = position["direction"]
+                    entry = float(position["entry_price"])
+                    tp_price = float(position["tp_price"])
+                    sl_price = float(position["sl_price"])
+                    size_usd = float(position["size_usd"])
 
-                        current_price = await asyncio.to_thread(
-                            hl_client.get_mid_price, asset
+                    current_price = await asyncio.to_thread(
+                        hl_client.get_mid_price, asset
+                    )
+                    pnl_usd, pnl_pct = calculate_pnl(
+                        direction, size_usd, entry, current_price
+                    )
+
+                    exit_reason = check_exit_conditions(position, current_price)
+
+                    if exit_reason:
+                        logger.info(
+                            f"Exit condition triggered for {asset}: {exit_reason}"
                         )
-                        pnl_usd, pnl_pct = calculate_pnl(
-                            direction, size_usd, entry, current_price
+
+                        result = await asyncio.to_thread(hl_client.market_close, asset)
+                        logger.info(f"Closed position: {result}")
+
+                        opened_at = datetime.fromisoformat(position["opened_at"])
+                        duration_min = int((now - opened_at).total_seconds() / 60)
+
+                        update_position(
+                            conn=db_conn,
+                            position_id=position_id,
+                            status="closed",
+                            closed_at=now.isoformat(),
+                            pnl=pnl_usd,
+                            exit_price=current_price,
+                            exit_reason=exit_reason,
                         )
 
-                        exit_reason = check_exit_conditions(position, current_price)
+                        from db import get_signal_by_id
+                        from chart_renderer import render_pnl_summary
+                        from telegram_bot import send_close_summary
 
-                        if exit_reason:
-                            logger.info(
-                                f"Exit condition triggered for {asset}: {exit_reason}"
-                            )
+                        signal_data = get_signal_by_id(db_conn, position["signal_id"])
+                        win_rate = signal_data["win_rate"] if signal_data else 0.0
 
-                            result = await asyncio.to_thread(
-                                hl_client.market_close, asset
-                            )
-                            logger.info(f"Closed position: {result}")
+                        chart_image = render_pnl_summary(
+                            asset=asset,
+                            direction=direction,
+                            entry=entry,
+                            exit_price=current_price,
+                            pnl_usd=pnl_usd,
+                            pnl_pct=pnl_pct * 100,
+                            duration_min=duration_min,
+                        )
 
+                        await send_close_summary(
+                            pnl_chart=chart_image,
+                            asset=asset,
+                            direction=direction,
+                            entry=entry,
+                            exit_price=current_price,
+                            pnl_usd=pnl_usd,
+                            pnl_pct=pnl_pct * 100,
+                            duration_min=duration_min,
+                            win_rate=win_rate,
+                            application=telegram_app,
+                        )
+
+                        if position_id in last_update_times:
+                            del last_update_times[position_id]
+
+                    else:
+                        last_update = last_update_times.get(position_id)
+                        should_send_update = (
+                            last_update is None
+                            or (now - last_update).total_seconds() >= update_interval
+                        )
+
+                        if should_send_update:
                             opened_at = datetime.fromisoformat(position["opened_at"])
                             duration_min = int((now - opened_at).total_seconds() / 60)
 
-                            update_position(
-                                conn=db_conn,
-                                position_id=position_id,
-                                status="closed",
-                                closed_at=now.isoformat(),
-                                pnl=pnl_usd,
-                                exit_price=current_price,
-                                exit_reason=exit_reason,
-                            )
+                            from telegram_bot import send_pnl_update
 
-                            from db import get_signal_by_id
-                            from chart_renderer import render_pnl_summary
-                            from telegram_bot import send_close_summary
-
-                            signal_data = get_signal_by_id(
-                                db_conn, position["signal_id"]
-                            )
-                            win_rate = signal_data["win_rate"] if signal_data else 0.0
-
-                            chart_image = render_pnl_summary(
+                            await send_pnl_update(
                                 asset=asset,
                                 direction=direction,
                                 entry=entry,
-                                exit_price=current_price,
+                                current_price=current_price,
                                 pnl_usd=pnl_usd,
                                 pnl_pct=pnl_pct * 100,
                                 duration_min=duration_min,
-                            )
-
-                            await send_close_summary(
-                                pnl_chart=chart_image,
-                                asset=asset,
-                                direction=direction,
-                                entry=entry,
-                                exit_price=current_price,
-                                pnl_usd=pnl_usd,
-                                pnl_pct=pnl_pct * 100,
-                                duration_min=duration_min,
-                                win_rate=win_rate,
                                 application=telegram_app,
                             )
+                            last_update_times[position_id] = now
 
-                            if position_id in last_update_times:
-                                del last_update_times[position_id]
+                except Exception as e:
+                    logger.error(
+                        f"Error monitoring position {position['id']}: {e}",
+                        exc_info=True,
+                    )
+                    continue
 
-                        else:
-                            last_update = last_update_times.get(position_id)
-                            should_send_update = (
-                                last_update is None
-                                or (now - last_update).total_seconds()
-                                >= update_interval
-                            )
+        except Exception as e:
+            logger.error(f"Error in position monitor loop: {e}", exc_info=True)
 
-                            if should_send_update:
-                                opened_at = datetime.fromisoformat(
-                                    position["opened_at"]
-                                )
-                                duration_min = int(
-                                    (now - opened_at).total_seconds() / 60
-                                )
-
-                                from telegram_bot import send_pnl_update
-
-                                await send_pnl_update(
-                                    asset=asset,
-                                    direction=direction,
-                                    entry=entry,
-                                    current_price=current_price,
-                                    pnl_usd=pnl_usd,
-                                    pnl_pct=pnl_pct * 100,
-                                    duration_min=duration_min,
-                                    application=telegram_app,
-                                )
-                                last_update_times[position_id] = now
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error monitoring position {position['id']}: {e}",
-                            exc_info=True,
-                        )
-                        continue
-
-            except Exception as e:
-                logger.error(f"Error in position monitor loop: {e}", exc_info=True)
-
-            await asyncio.sleep(check_interval)
-    except asyncio.CancelledError:
-        logger.info("Position monitor cancelled, exiting")
-        return
+        await asyncio.sleep(check_interval)
 
 
 async def synth_poller(
@@ -529,7 +517,7 @@ async def synth_poller(
     logger.info("Starting Synth API poller loop")
 
     from settings import SettingsManager
-    from strategy import evaluate_signal
+    from strategy import evaluate_signal, evaluate_signal_multi_horizon
     from db import save_signal
     from chart_renderer import fetch_candles, render_signal_chart
     from telegram_bot import send_signal_alert
@@ -537,28 +525,47 @@ async def synth_poller(
     if settings_manager is None:
         settings_manager = SettingsManager()
 
-    try:
-        while True:
-            interval = 10
-            try:
-                settings_manager.reset_credits_if_new_cycle()
+    while True:
+        try:
+            settings_manager.reset_credits_if_new_cycle()
 
-                auto_scan = settings_manager.get("auto_scan")
-                if not auto_scan:
-                    logger.info("Auto-scan disabled, waiting...")
-                    await asyncio.sleep(10)
-                    continue
+            auto_scan = settings_manager.get("auto_scan")
+            if not auto_scan:
+                logger.info("Auto-scan disabled, waiting...")
+                await asyncio.sleep(10)
+                continue
 
-                assets = settings_manager.get_active_assets()
-                long_pct, short_pct = settings_manager.get_percentiles()
-                interval = settings_manager.get_optimal_poll_interval()
+            assets = settings_manager.get_active_assets()
+            long_pct, short_pct = settings_manager.get_percentiles()
+            interval = settings_manager.get_optimal_poll_interval()
+            multi_horizon = settings_manager.get("multi_horizon")
+            secondary_horizon = settings_manager.get("secondary_horizon")
 
-                logger.info(
-                    f"Polling Synth API for {len(assets)} assets, interval={interval}s"
-                )
+            logger.info(
+                f"Polling Synth API for {len(assets)} assets, interval={interval}s, "
+                f"multi_horizon={multi_horizon}"
+            )
 
-                for asset in assets:
-                    try:
+            for asset in assets:
+                try:
+                    if multi_horizon:
+                        data_1h = await synth_client.get_prediction_percentiles(
+                            asset, horizon="1h"
+                        )
+                        data_secondary = await synth_client.get_prediction_percentiles(
+                            asset, horizon=secondary_horizon
+                        )
+
+                        settings_manager.increment_credits_used(2)
+
+                        signal = evaluate_signal_multi_horizon(
+                            asset,
+                            data_1h,
+                            data_secondary,
+                            long_pct=long_pct,
+                            short_pct=short_pct,
+                        )
+                    else:
                         percentile_data = await synth_client.get_prediction_percentiles(
                             asset, horizon="1h"
                         )
@@ -572,46 +579,44 @@ async def synth_poller(
                             short_pct=short_pct,
                         )
 
-                        if signal:
-                            signal_id = save_signal(db_conn, signal, status="pending")
-                            signal.id = signal_id
+                    if signal:
+                        signal_id = save_signal(db_conn, signal, status="pending")
+                        signal.id = signal_id
 
-                            logger.info(
-                                f"Generated signal: {asset} {signal.direction.upper()}"
-                            )
+                        logger.info(
+                            f"Generated signal: {asset} {signal.direction.upper()} "
+                            f"(strength={signal.strength}, multi_horizon={multi_horizon})"
+                        )
 
-                            hl_client = HLClient(
-                                HL_WALLET_ADDRESS, HL_PRIVATE_KEY, HL_TESTNET
-                            )
+                        hl_client = HLClient(
+                            HL_WALLET_ADDRESS, HL_PRIVATE_KEY, HL_TESTNET
+                        )
 
-                            candle_data = fetch_candles(asset, num_candles=60)
-                            percentile_band = (
-                                signal.stop_loss,
-                                signal.take_profit,
-                            )
+                        candle_data = fetch_candles(asset, num_candles=60)
+                        percentile_band = (
+                            signal.stop_loss,
+                            signal.take_profit,
+                        )
 
-                            chart_image = render_signal_chart(
-                                candle_data=candle_data,
-                                signal=signal,
-                                percentile_band=percentile_band,
-                                asset=asset,
-                            )
+                        chart_image = render_signal_chart(
+                            candle_data=candle_data,
+                            signal=signal,
+                            percentile_band=percentile_band,
+                            asset=asset,
+                        )
 
-                            await send_signal_alert(
-                                signal=signal,
-                                chart_image=chart_image,
-                                default_size=100.0,
-                                application=telegram_app,
-                            )
+                        await send_signal_alert(
+                            signal=signal,
+                            chart_image=chart_image,
+                            default_size=100.0,
+                            application=telegram_app,
+                        )
 
-                    except Exception as e:
-                        logger.error(f"Error polling {asset}: {e}", exc_info=True)
-                        continue
+                except Exception as e:
+                    logger.error(f"Error polling {asset}: {e}", exc_info=True)
+                    continue
 
-            except Exception as e:
-                logger.error(f"Error in synth poller loop: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error in synth poller loop: {e}", exc_info=True)
 
-            await asyncio.sleep(interval)
-    except asyncio.CancelledError:
-        logger.info("Synth poller cancelled, exiting")
-        return
+        await asyncio.sleep(interval)

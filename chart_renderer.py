@@ -153,7 +153,7 @@ def render_signal_chart(
         color="#6b5b95",
     )
 
-    title = f"{asset} — {signal.direction.upper()} Signal"
+    title = f"{asset} — {signal.direction.upper()} Signal (Strength: {signal.strength})"
     title_color = "white"
 
     fig, axes = mpf.plot(
