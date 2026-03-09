@@ -96,14 +96,30 @@ async def main():
         logger.info("All tasks started. Running concurrently...")
         try:
             await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt, shutting down...")
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Shutting down...")
         finally:
-            await telegram_app.updater.stop()
-            await telegram_app.stop()
-            await telegram_app.shutdown()
+            for task in tasks:
+                task.cancel()
+
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                pass
+
+            try:
+                updater = getattr(telegram_app, "updater", None)
+                if updater and getattr(updater, "running", False):
+                    await updater.stop()
+            except Exception:
+                pass
+
+            try:
+                await telegram_app.stop()
+                await telegram_app.shutdown()
+            except Exception:
+                pass
+
             db_conn.close()
             logger.info("Database connection closed")
 
