@@ -196,6 +196,13 @@ python3 main.py --dry-run
 - Check that your chat ID is whitelisted in `TELEGRAM_CHAT_ID`
 - Ensure the bot is running (`python3 main.py`)
 
+### Debugging Signal Evaluation
+To monitor signal evaluation in real-time and see why signals are/aren't triggering:
+```bash
+tail -f spillthebeans.log | grep "SIGNAL DEBUG"
+```
+This shows current price vs. key percentiles (p50, p05, p95) and trigger thresholds for each asset on every poll.
+
 ## Safety Notes
 
 ⚠️ **IMPORTANT SECURITY WARNINGS**:

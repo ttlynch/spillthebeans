@@ -67,6 +67,15 @@ def evaluate_signal(
 
     final_percentiles = percentiles[-1]
 
+    p50 = final_percentiles.get("0.5")
+    p05 = final_percentiles.get("0.05")
+    p95 = final_percentiles.get("0.95")
+    p_long = final_percentiles.get(long_pct)
+    p_short = final_percentiles.get(short_pct)
+    logger.info(
+        f"[SIGNAL DEBUG] {asset} long_pct={long_pct} short_pct={short_pct} price={current_price} p50={p50} p_long={p_long} p_short={p_short} p05={p05} p95={p95}"
+    )
+
     now = datetime.utcnow()
 
     p_long = final_percentiles.get(long_pct)
